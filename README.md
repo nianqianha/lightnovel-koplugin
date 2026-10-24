@@ -1,0 +1,82 @@
+# lightnovel.koplugin
+
+[轻之国度](https://www.lightnovel.fun) 的 KOReader 插件：书架下载、评论抓取、EPUB 导出。
+
+在 Kindle 上把轻小说变成离线 EPUB，评论（段评）附在对应章节末尾。
+
+## 功能
+
+| 功能 | 说明 |
+|---|---|
+| 书架同步 | 登录账号后浏览服务器书架，支持搜索 |
+| 整本缓存 | 一键缓存全部章节，断点续传 |
+| 评论抓取 | 自动按卷归属核验，防止串书；下载时自动抓取 |
+| EPUB 导出 | 缓存 + 评论 + 封面打包成 EPUB，直接放书架 |
+| 插图缓存 | 首次下载后缓存插图，重出版不重下 |
+| 任务进度 | 可隐藏 / 暂停 / 后台继续，切书不中断 |
+| 诊断日志 | 菜单一键导出，USB 取走发给开发者 |
+
+## 安装
+
+### 需要
+
+- 越狱 Kindle（已装 KOReader）
+- KOReader v2026.07+
+- 轻之国度账号（免费注册）
+
+### 步骤
+
+1. 把 `plugin/` 里的内容拷到 `koreader/plugins/lightnovel.koplugin/`
+2. （可选翻页加速）把 `patches/2-zz-pageturn-fast.lua` 拷到 `koreader/patches/`
+3. 重启 KOReader
+
+目录结构：
+
+```
+koreader/
+├── plugins/
+│   └── lightnovel.koplugin/
+│       ├── _meta.lua
+│       ├── main.lua
+│       └── lightnovel/
+│           ├── lib/
+│           └── ui/
+└── patches/
+    └── 2-zz-pageturn-fast.lua   （可选）
+```
+
+## 使用
+
+1. KOReader 菜单 → 轻之国度 → 登录
+2. 书架 → 长按一本书 → 目录页
+3. 点「下载入库」——缓存章节 + 抓评论 + 导出 EPUB，一步到位
+4. 导出的书在 `documents/Downloads/` 里，直接打开阅读
+
+评论在对应章节末尾，以附录形式嵌入 EPUB。
+
+## 翻页加速补丁（可选）
+
+`2-zz-pageturn-fast.lua` 放到 `koreader/patches/` 后：
+
+- 文字页 DU 极速（约 100ms）
+- 插图页自动灰阶（清晰、不整刷）
+- 菜单/按键温和刷新（无黑闪）
+- 每 N 页文字自动整刷一次（防残影，N 可调）
+
+设置 → 翻页优化 里可随时开关。
+
+## 遇到问题
+
+菜单 → 导出诊断日志 → USB 连电脑 → `documents/lightnovel-诊断-*.txt` 发给开发者。
+
+日志不含登录凭据。
+
+## 已知限制
+
+- EPUB 插图不压缩（设备端无 JPEG 编码器）
+- 评论归属依赖站点数据，重置版合卷的书部分卷无评论（站点本身未归属）
+- 搜索结果最多显示 3 页
+
+## License
+
+MIT
