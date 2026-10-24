@@ -158,16 +158,23 @@ UIManager._refresh = function(self, mode, region, dither)
     refresh_flag(false)
     force_wf_level_once()
     if enabled and mode == "partial" and not region then
-        -- b42（终版定案）：图页判定整体撤销，全部翻页走 DU。
+        -- b43（读者改选画质）：图页走 full 整刷（GC16 灰阶，闪一下），
+        -- 文字页走 DU 极速。
         --
-        -- 三轮实测链条：b39 旁路 partial 不行（MTK 驱动把所有 partial 按
-        -- 1-bit 处理）；b40 img_count 判定正确但旁路仍 1-bit；b41 dither=true
-        -- 触发 Y4 抖动也不行。源码定案（readerview.lua:285）：KOReader 原生
-        -- 图页的"清晰"来自 refresh_on_pages_with_images 默认触发的 **full
-        -- 整刷（闪一下）**，不是 partial 灰阶——MTK fast mode 下 partial
-        -- 永远 1-bit，没有无闪灰阶选项。
-        -- 读者选择：不闪 > 画质。全部走 DU。
-        if page_turn_hooked
+        -- b42 曾全走 DU（不闪），读者后改主意："有图的弄成闪吧"。原因：
+        -- MTK fast mode 下 partial 永远 1-bit，唯一灰阶路径是 full。
+        -- KOReader 原生对 >7.5% 覆盖的图页本来就会自动 full（闪+清晰），
+        -- 我们的补丁之前把它拦下来转 DU 导致图糊。现在恢复正确行为：
+        -- 有图 → full（画质）；无图 → DU（速度）。
+        local is_image = false
+        do
+            local ok, result = pcall(page_is_image_page, dither)
+            is_image = (not ok) or result
+        end
+        if is_image then
+            mode = "full"
+            dither = true
+        elseif page_turn_hooked
             and (function()
                 local ReaderUI = require("apps/reader/readerui")
                 local inst = ReaderUI and ReaderUI.instance
