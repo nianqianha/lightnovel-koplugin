@@ -95,6 +95,15 @@ local function page_is_image_page(dither)
     local coverage = tonumber(view.img_coverage) or 0
     local img_count = tonumber(view.img_count) or 0
     local dialog_dithered = view.dialog and view.dialog.dithered or false
+    -- b40 诊断打点（临时 INFO）：读者报"文字+大图（>5%）仍走 DU"，
+    -- 需要看 img_count/coverage 在混合页的真实值。
+    local logger_ok, logger = pcall(require, "logger")
+    if logger_ok and logger then
+        logger.info("fastpage judge: img_count=", tostring(img_count),
+            " coverage=", string.format("%.3f", coverage),
+            " dithered=", tostring(dialog_dithered),
+            " dither_param=", tostring(dither))
+    end
     -- b40（读者报"文字和图片共存的情况还是 DU"）：旧判定只看覆盖率
     -- ≥5%，文字+小图的页（图占屏 <5%）被判成纯文字页走 DU，小图被
     -- 1-bit 化。改为 img_count > 0 即图页——哪怕一张装饰图也不吃 DU。
@@ -149,34 +158,17 @@ UIManager._refresh = function(self, mode, region, dither)
     refresh_flag(false)
     force_wf_level_once()
     if enabled and mode == "partial" and not region then
-        local images_allowed = du_on_images()
-        local is_image = false
-        if not images_allowed then
-            -- pcall 失败按"是图页"处理：GL16 慢一点，但绝不 1-bit 化插图。
-            local ok, result = pcall(page_is_image_page, dither)
-            is_image = (not ok) or result
-        end
-        if images_allowed then
-            dither = false
-            mode = "fast"
-        elseif is_image then
-            -- 图页：**完全旁路**（A/B 实测定案 2026-10-24：补丁禁用时图页
-            -- 清晰、启用时糊）。此前"放行 partial + dither=true"看似等价于
-            -- 原生，实际补丁层传入的 dither 与原生路径（CRe 提交时自带的
-            -- dithered 标志）走了不同驱动分支，图仍 1-bit 化。透传原参数，
-            -- 一个字节不改，图页表现与补丁不存在时完全一致。
-            -- b33（读者要求"图片页也能不全刷"）：图页不再触发 full 整刷，
-            -- 也不计入全刷节奏——透传 partial 原参数即可（原生 dithered
-            -- 路径的灰阶质量与全刷一致，但无整屏反转）。残影由文字页每
-            -- N 页的 full 常规清理兜底。
-            return orig_refresh(self, mode, region, dither)
-        elseif page_turn_hooked
+        -- b42（终版定案）：图页判定整体撤销，全部翻页走 DU。
+        --
+        -- 三轮实测链条：b39 旁路 partial 不行（MTK 驱动把所有 partial 按
+        -- 1-bit 处理）；b40 img_count 判定正确但旁路仍 1-bit；b41 dither=true
+        -- 触发 Y4 抖动也不行。源码定案（readerview.lua:285）：KOReader 原生
+        -- 图页的"清晰"来自 refresh_on_pages_with_images 默认触发的 **full
+        -- 整刷（闪一下）**，不是 partial 灰阶——MTK fast mode 下 partial
+        -- 永远 1-bit，没有无闪灰阶选项。
+        -- 读者选择：不闪 > 画质。全部走 DU。
+        if page_turn_hooked
             and (function()
-                -- b39 定案：标记由 ReaderView:onPageUpdate 设置（b34 钩子），
-                -- 必须从 ReaderUI.instance.**view** 读——b32 起错误地从
-                -- ReaderUI.instance 上找，永远找不到 → 翻页全部掉进菜单
-                -- 分支被降为 ui（读者"现在的 DU 比当年慢"即此，80-111ms 的
-                -- Fast 路径 bench_results_v2~v5 实测 vs ui 灰阶慢刷）。
                 local ReaderUI = require("apps/reader/readerui")
                 local inst = ReaderUI and ReaderUI.instance
                 local view = inst and inst.view
@@ -187,7 +179,7 @@ UIManager._refresh = function(self, mode, region, dither)
                 end
                 return false
             end)() then
-            -- 文字页翻页：DU 极速；满阈值时本页升级 full 整刷。
+            -- 翻页（含图页）：DU 极速；满阈值时本页升级 full 整刷。
             local rate = tonumber(G_reader_settings:readSetting("full_refresh_count")) or 10
             if rate > 0 and page_turn_count >= rate then
                 page_turn_count = 0
