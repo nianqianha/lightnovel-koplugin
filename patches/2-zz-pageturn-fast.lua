@@ -93,17 +93,14 @@ local function page_is_image_page(dither)
     local view = ReaderUI.instance.view
     if not view then return true end
     local coverage = tonumber(view.img_coverage) or 0
+    local img_count = tonumber(view.img_count) or 0
     local dialog_dithered = view.dialog and view.dialog.dithered or false
-    -- 诊断打点降为 dbg（2026-10-24：判定链已由 INFO 打点实锤定案——图页
-    -- coverage 0.57-0.72 正确返回 true，文字页 0.000 走 DU。按日志规范
-    -- 高频诊断不落盘。）
-    local logger_ok, logger = pcall(require, "logger")
-    if logger_ok and logger then
-        logger.dbg("fastpage judge: dither=", tostring(dither),
-            " dialog.dithered=", tostring(dialog_dithered),
-            " img_coverage=", string.format("%.3f", coverage),
-            " mode_field=", tostring(view.view_mode))
-    end
+    -- b40（读者报"文字和图片共存的情况还是 DU"）：旧判定只看覆盖率
+    -- ≥5%，文字+小图的页（图占屏 <5%）被判成纯文字页走 DU，小图被
+    -- 1-bit 化。改为 img_count > 0 即图页——哪怕一张装饰图也不吃 DU。
+    -- img_count 与 img_coverage 同在 paintTo 里由 getDrawnImagesStatistics
+    -- 更新（readerview.lua:274-278），时序一致。
+    if img_count > 0 then return true end
     if dialog_dithered then
         return coverage >= IMAGE_COVERAGE_GL16 * 0.5
     end
