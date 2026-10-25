@@ -157,6 +157,11 @@ end)
 UIManager._refresh = function(self, mode, region, dither)
     refresh_flag(false)
     force_wf_level_once()
+    -- b45 全链路打点：入口 mode / 是否带 region / currently_scrolling，
+    -- 以及图页命中的最终 mode。一次翻页即可定案（前几轮靠猜浪费太多轮次）。
+    local mode_in, region_in, scroll_in = mode, region and "yes" or "no",
+        tostring(self.currently_scrolling)
+    local mode_out = "--"
     if enabled and mode == "partial" and not region then
         -- b43（读者改选画质）：图页走 full 整刷（GC16 灰阶，闪一下），
         -- 文字页走 DU 极速。
@@ -172,8 +177,19 @@ UIManager._refresh = function(self, mode, region, dither)
             is_image = (not ok) or result
         end
         if is_image then
-            mode = "full"
-            dither = true
+            -- b46（源码定案·终版）：图页**原样透传 partial**。
+            --
+            -- framebuffer_mxcfb.lua:893-901（Kindle MTK 分支）：
+            --   waveform_fast    = MTK_WAVEFORM_MODE_DU    → 1-bit 黑白
+            --   waveform_partial = MTK_WAVEFORM_MODE_GLR16 → **REAGL 灰阶**
+            --   waveform_full    = WAVEFORM_MODE_GC16      → 灰阶
+            -- 即：原生的 partial 本来就是灰阶！b32 起把图页 partial 改成
+            -- fast(DU) 才是"图变黑白"的唯一原因；b39-b45 的 ui/flashui/full
+            -- 全是在绕这个自造的问题。
+            -- 唯一需要防的：uimanager.lua:1130 在 currently_scrolling 为真时
+            -- 把一切降 fast —— 清掉它，让真正的 partial(GLR16) 走到驱动。
+            UIManager.currently_scrolling = false
+            return orig_refresh(self, mode, region, dither)
         elseif page_turn_hooked
             and (function()
                 local ReaderUI = require("apps/reader/readerui")
@@ -201,6 +217,11 @@ UIManager._refresh = function(self, mode, region, dither)
             -- 且不再被 KOReader 原生计数器升级成 full（ui 不进计数）。
             mode = "ui"
         end
+    end
+    if mode ~= mode_in then
+        logger.info("fastpage refresh: ", mode_in, "(region=", region_in,
+            ", scroll=", scroll_in, ") -> ", mode,
+            " is_image_path=", tostring(mode == "flashui"))
     end
     return orig_refresh(self, mode, region, dither)
 end
