@@ -34,6 +34,53 @@ local function force_wf_level_once()
     -- no-op since b38
 end
 
+-- b47 观测（只读，不改行为）：dump 驱动层波形常量的真实数值。
+--
+-- 前六轮全在猜 mode 名的语义，这次直接读实际映射：Screen.waveform_* 的
+-- 数值 + MTK 常量表。一次翻页即可确认 partial 究竟映射到什么波形、
+-- 以及我们的 mode 字符串最终是否真的送到那个波形。
+local wf_dumped = false
+local function dump_waveforms_once()
+    if wf_dumped then return end
+    wf_dumped = true
+    pcall(function()
+        local Device = require("device")
+        local Screen = Device.screen
+        logger.info("fastpage WAVEFORMS: fast=", tostring(Screen.waveform_fast),
+            " partial=", tostring(Screen.waveform_partial),
+            " full=", tostring(Screen.waveform_full),
+            " ui=", tostring(Screen.waveform_ui),
+            " flashui=", tostring(Screen.waveform_flashui),
+            " a2=", tostring(Screen.waveform_a2))
+        pcall(function()
+            local C = require("ffi/mxcfb_mtk_h")
+            logger.info("fastpage MTK consts: MTK_DU=",
+                tostring(C.MTK_WAVEFORM_MODE_DU),
+                " MTK_GLR16=", tostring(C.MTK_WAVEFORM_MODE_GLR16),
+                " GL16=", tostring(C.WAVEFORM_MODE_GL16),
+                " GC16=", tostring(C.WAVEFORM_MODE_GC16),
+                " AUTO=", tostring(C.WAVEFORM_MODE_AUTO))
+        end)
+        logger.info("fastpage hw_dither=", tostring(Screen:canHWDither()),
+            " scrolling=", tostring(require("ui/uimanager").currently_scrolling))
+    end)
+    -- b48 终极观测：hook 驱动层 mech_refresh，打印实际送进驱动的波形数值。
+    -- 这一步能直接看出"透传"到底送了什么波形给硬件，不再依赖上层推测。
+    pcall(function()
+        local Device = require("device")
+        local Screen = Device.screen
+        local orig_mech = Screen.mech_refresh
+        if type(orig_mech) ~= "function" then return end
+        Screen.mech_refresh = function(fb, is_flashing, waveform_mode, x, y, w, h, dither)
+            logger.info("fastpage MECH: wf=", tostring(waveform_mode),
+                " flashing=", tostring(is_flashing),
+                " dither=", tostring(dither),
+                " region=", tostring(w), "x", tostring(h))
+            return orig_mech(fb, is_flashing, waveform_mode, x, y, w, h, dither)
+        end
+    end)
+end
+
 local FAST_FLAG = "/mnt/us/koreader/_fastpage.on"
 local IMAGE_COVERAGE_GL16 = 0.05
 
@@ -157,6 +204,7 @@ end)
 UIManager._refresh = function(self, mode, region, dither)
     refresh_flag(false)
     force_wf_level_once()
+    dump_waveforms_once()
     -- b45 全链路打点：入口 mode / 是否带 region / currently_scrolling，
     -- 以及图页命中的最终 mode。一次翻页即可定案（前几轮靠猜浪费太多轮次）。
     local mode_in, region_in, scroll_in = mode, region and "yes" or "no",
