@@ -54,6 +54,14 @@ local TaskDialog = require("lightnovel.ui.task_dialog")
 -- 放在模块级表里，require 缓存让它在整个进程内只跑一次。
 local SELFCHECK_STATE = { done = false }
 
+-- 进度诊断日志的配额（b39）。读者报"下载弹窗不显示进度"，但只有两条可能：
+-- (a) 弹窗根本没收到进度载荷；(b) 收到了但没重绘。代码看着都通，只能取证。
+-- 每个进程只打前 8 条，正常使用时日志里就这几行，用完即止。
+-- b43：改成"每个阶段各 3 条"。原来总共只有 8 条，一次下载里 catalog + export_route
+-- 就用光了，prefetch/pack 阶段一条都不剩——排查时看到的正是"导出阶段无日志"。
+local PROGRESS_LOG_SEEN = {}
+local PROGRESS_LOG_PER_STAGE = 3
+
 -- 跨实例存活的任务登记（b22）。
 --
 -- KOReader 在阅读器 ⇄ 文件管理器切换时会重建插件实例（init 每次重跑，
@@ -103,10 +111,19 @@ function LightNovelPlugin:init()
     self.settings = Settings:new()
     self.client = Client:new(self.settings)
     self.cache = Cache:new(self.settings)
-    self.worker = Worker:new{
+    -- worker 必须跨插件实例共享（b41）。
+    --
+    -- KOReader 在阅读器 ⇄ 文件管理器之间切换时会重建插件实例，init 每次重跑。
+    -- 原来这里每次 new 一个 Worker：重建之后 self.worker 是**新的空壳**，而正在跑的
+    -- 那个 job 还挂在旧实例的 Worker 上——于是新实例看不到进度、暂停/退出作用在
+    -- 一个没有 job 的对象上返回 false（读者看到的就是"点了没反应/任务像是丢了"）。
+    -- crash.log 里 23:53–23:56 三分钟内 BUILD 出现 5 次，正是一次下载被重建打断。
+    -- 和 b22 的 STATE.task 同一个道理：任务归属必须放在模块级。
+    STATE.worker = STATE.worker or Worker:new{
         temp_dir = self.settings:workerDir(),
         min_available_kb = 64 * 1024,
     }
+    self.worker = STATE.worker
     -- Do this once, at load, before anything can be opened: from here on the
     -- per-chapter cache files never become "正在阅读" rows, and only a published
     -- whole book does. Wraps ReadHistory.addItem, is idempotent, and also sweeps
@@ -178,7 +195,7 @@ self:registerMenu()
 -- deploy does NOT take effect until the app is restarted; without this line
 -- there is no way to tell which build the device is actually running, and a
 -- stale build looks exactly like a new bug.
-logger.info("BUILD b31-selfcheck-once (自检不再每次实例重跑、诊断截图改为标志文件按需启用; 含 b19-b30 全部修复)",
+logger.info("BUILD b54-task-gap-diag (任务进度入口常驻; 点开无任务时记日志, 定位两阶段之间的空档; 含 b19-b53)",
     "at", tostring(os.date("%Y-%m-%d %H:%M:%S")))
 logger.info("initialized version=", self.version)
 end
@@ -769,6 +786,42 @@ function LightNovelPlugin:checkForUpdates()
     return true
 end
 
+--- 上次导出的插图健康度（b33，读 bookDir/export_status.lua）。
+---
+--- 以前"导出缺图"只写日志：书已经在库里，读者点「库中书更新」永远只得到
+--- 一句"已是最新"，想补图只能手动删掉 EPUB 再点「下载入库」。这里把导出
+--- 结果落盘，让更新动作自己发现缺图并重出。
+---
+--- 没有状态文件 = 旧版本导出（他当时还不知道要记录），无法判断是否缺图，
+--- 重建一次以取得状态；之后按失败占比决定。
+function LightNovelPlugin:lastExportStatus()
+    local key = self.current_key
+    if not key then return nil end
+    local path = self.settings:bookDir(key) .. "/export_status.lua"
+    local chunk = loadfile(path)
+    if not chunk then
+        return { repair = true, failed = 0, unsupported = 0, total = 0 }
+    end
+    local ok, st = pcall(chunk)
+    if not ok or type(st) ~= "table" then
+        return { repair = true, failed = 0, unsupported = 0, total = 0 }
+    end
+    local total = tonumber(st.total) or 0
+    local failed = tonumber(st.failed) or 0
+    local unsupported = tonumber(st.unsupported) or 0
+    -- 白名单版本变了 = 上次被拒的图现在可能取得到，必须重出一次。
+    -- 少了这条，改完白名单点「库中书更新」只会回"已是最新"，那批图永远补不进来
+    -- （2026-10-27 实测：《游戏人生》14:30 点更新无任何动作，就是这个原因）。
+    local stored_wl = tonumber(st.whitelist) or 0
+    local current_wl = tonumber(Export.IMAGE_WHITELIST_VERSION) or 0
+    -- 其余情况只按"抓取失败"占比 ≥25% 触发：零星上游死链重导也不会好，
+    -- 不能让它把每次点更新都变成一次全量导出。
+    local repair = (failed >= 3 and failed * 4 >= total)
+        or (unsupported > 0 and stored_wl ~= current_wl)
+    return { repair = repair, failed = failed, unsupported = unsupported,
+        total = total, missing = st.missing, whitelist = stored_wl }
+end
+
 --- Turn a check result into words, and offer the download when there is one.
 function LightNovelPlugin:_reportUpdate(info)
     local total = tonumber(info.total) or 0
@@ -799,6 +852,18 @@ function LightNovelPlugin:_reportUpdate(info)
             self:cacheWholeBook({})
             return
         end
+        -- b33：上次导出缺图（图床白名单拒收/大量超时）也重出。读者要的是
+        -- "点一下更新就把插图补齐"，不必先删库中书。阈值在 lastExportStatus
+        -- 里，零星上游死链不会触发，避免每次更新都全量重导。
+        local st = self:lastExportStatus()
+        if st and st.repair then
+            logger.info("checkForUpdates: up to date but last export was",
+                "incomplete; republishing. failed=", tostring(st.failed),
+                "unsupported=", tostring(st.unsupported),
+                "total=", tostring(st.total))
+            self:cacheWholeBook({})
+            return
+        end
         UIManager:show(InfoMessage:new{ text = text })
         return
     end
@@ -824,6 +889,55 @@ function LightNovelPlugin:_reportUpdate(info)
     })
     -- Downloading is the obvious next step, so it is offered rather than assumed.
     self:cacheWholeBook({ force = info.changed })
+end
+
+-- 新内容书籍的按卷评论（2026-10-27）。
+--
+-- 抓取在 worker 子进程里做（`CommentSync:queue_volumes`），这里只负责两件父进程的事：
+-- 从目录里挑出"声明了评论数的卷"，以及抓完后把目录里的卷映射指到评论库的键上
+-- （`NEW_COMMENT_KEY_BASE + volume_id`）。导出侧不动——它本来就是 volume_scoped，
+-- 会在该卷最后一章之后挂一次「本卷评论（N 条）」。
+local function collect_comment_volumes(catalog)
+    local chapters = (catalog or {}).chapters or {}
+    local counts, order = {}, {}
+    for _i, chapter in ipairs(chapters) do
+        local vid = tonumber(chapter.volume_id) or 0
+        local count = tonumber(chapter.volume_comment_count) or 0
+        if vid > 0 then
+            if not counts[vid] then
+                counts[vid] = count
+                order[#order + 1] = vid
+            elseif count > counts[vid] then
+                counts[vid] = count
+            end
+        end
+    end
+    local volumes = {}
+    for _i, vid in ipairs(order) do
+        if counts[vid] > 0 then
+            volumes[#volumes + 1] = { volume_id = vid, count = counts[vid] }
+        end
+    end
+    return volumes
+end
+
+--- 把抓到的卷评论映射写回目录：该卷各章的 comment_aid 指向评论库键并标已验证。
+function LightNovelPlugin:_applyVolumeCommentMapping(catalog, volumes, key)
+    if type(catalog) ~= "table" then return end
+    local wanted = {}
+    for _i, entry in ipairs(volumes or {}) do
+        local vid = tonumber(entry.volume_id)
+        if vid then wanted[vid] = true end
+    end
+    local base = tonumber(CommentSync.NEW_COMMENT_KEY_BASE) or 0
+    for _i, chapter in ipairs(catalog.chapters or {}) do
+        local vid = tonumber(chapter.volume_id) or 0
+        if vid > 0 and wanted[vid] then
+            chapter.comment_aid = base + vid
+            chapter.comment_mapping_verified = true
+        end
+    end
+    self.cache:save_catalog(key, catalog)
 end
 
 function LightNovelPlugin:cacheWholeBook(options)
@@ -1222,6 +1336,27 @@ function LightNovelPlugin:cacheWholeBook(options)
                     _("有 %d 章是付费内容、未解锁，已跳过；已入库 %d 章。"),
                     locked, obtained))
             end
+            -- 新内容书籍：走公开的按卷评论接口，全程在 worker 里跑（父进程不阻塞）。
+            -- 失败不影响出版：on_finished 无论如何都会 publish_now。
+            if new_content_book and not (options and options.skip_comments) then
+                local volumes = collect_comment_volumes(catalog)
+                if #volumes > 0 then
+                    local queued, why = self.comment_sync:queue_volumes(
+                        tonumber(book_id) or 0, volumes, {
+                            on_finished = function(_result, written)
+                                if (tonumber(written) or 0) > 0 then
+                                    pcall(function()
+                                        self:_applyVolumeCommentMapping(
+                                            catalog, volumes, key)
+                                    end)
+                                end
+                                publish_now()
+                            end,
+                        })
+                    if queued then return end
+                    logger.warn("comments(new-content): not queued:", tostring(why))
+                end
+            end
             if #aids > 0 and self.comment_sync then
                 local queued = self.comment_sync:queue_background(aids, {
                     on_finished = function()
@@ -1405,6 +1540,20 @@ function LightNovelPlugin:exportBook(options)
             return
         end
         if not path then
+            -- b44：子进程静默死亡（worker_no_result —— 多半是被系统 OOM 杀掉）时
+            -- 自动重跑一次。已经抓到的插图都在磁盘缓存里，第二次明显更快，成功率高
+            -- 得多；不重试的话读者只能自己再点一遍，还得先看到一条"导出失败"。
+            -- 只重试一次（options._retried），避免在真·坏数据上反复烧电。
+            if reason == "worker_no_result" and not options._retried then
+                logger.info("exportBook: worker died without result; retrying once")
+                local retry_options = {}
+                for k, v in pairs(options) do retry_options[k] = v end
+                retry_options._retried = true
+                UIManager:scheduleIn(2, function()
+                    self:exportBook(retry_options)
+                end)
+                return
+            end
             logger.err("exportBook failed:", tostring(reason))
             UIManager:show(InfoMessage:new{
                 text = _("导出失败：") .. tostring(reason or "unknown"),
@@ -1417,9 +1566,27 @@ function LightNovelPlugin:exportBook(options)
         logger.info("exportBook done:", path, "chapters=", tostring(chapters),
             "comment_chapters=", tostring(comment_chapters))
         if not options.silent then
+            -- b37：把插图成败写进完成弹窗。读者在书里已经看不到占位符，
+            -- 缺了几张必须在这里说清楚，否则"没有任何提示"等于"全都好了"。
+            local images = ""
+            local st = self:lastExportStatus()
+            if st and (tonumber(st.total) or 0) > 0 then
+                local images_ok = (st.total or 0) - (st.failed or 0)
+                    - (st.unsupported or 0)
+                if images_ok < 0 then images_ok = 0 end
+                local lost = (st.failed or 0) + (st.unsupported or 0)
+                if lost > 0 then
+                    images = string.format(
+                        _("\n插图 %d/%d，%d 张仍缺（下次点「库中书更新」会重试）"),
+                        images_ok, st.total, lost)
+                else
+                    images = string.format(_("\n插图 %d/%d，全部正常"),
+                        images_ok, st.total)
+                end
+            end
             UIManager:show(InfoMessage:new{
-                text = string.format(_("已导出 %d 章（含 %d 章评论）\n%s"),
-                    chapters, comment_chapters, path),
+                text = string.format(_("已导出 %d 章（含 %d 章评论）%s\n%s"),
+                    chapters, comment_chapters, images, path),
             })
         end
         reopen_catalogue()
@@ -2702,6 +2869,17 @@ end
 --- the worker keeps emitting after the reader has hidden or exited the dialog.
 function LightNovelPlugin:reportTaskProgress(state)
     local dialog = STATE.dialog
+    do
+        local stage = tostring(state and state.stage or "?")
+        local seen = PROGRESS_LOG_SEEN[stage] or 0
+        if seen < PROGRESS_LOG_PER_STAGE then
+            PROGRESS_LOG_SEEN[stage] = seen + 1
+            logger.info("task progress:", stage,
+                "done=", tostring(state and state.done),
+                "total=", tostring(state and state.total),
+                "dialog=", tostring(dialog ~= nil))
+        end
+    end
     if not dialog then return end
     pcall(function() dialog:reportProgress(state) end)
 end
@@ -2713,6 +2891,9 @@ end
 function LightNovelPlugin:showTaskStatus()
     local task = STATE.task
     if not task then
+        -- 留一行日志：读者报"隐藏弹窗后菜单里没有任务进度"时，需要区分
+        -- "入口没渲染"和"任务确实被判空了"（2026-10-27 两阶段之间存在空档）。
+        logger.info("task status: no running task (entry tapped)")
         UIManager:show(InfoMessage:new{ text = _("当前没有正在进行的任务") })
         return
     end

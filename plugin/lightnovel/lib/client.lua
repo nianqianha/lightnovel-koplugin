@@ -123,7 +123,9 @@ local BROWSE = {
 
 -- The server rejects pageSize below 20; keep every list request at 20.
 local LIST_PAGE_SIZE = 20
--- page_size=100 was rejected outright, so comment paging stays at 20.
+-- page_size=100 was rejected outright, so legacy comment paging stays at 20.
+-- 新内容评论接口（get-book-comments）接受 50，实测可用，页数因此少一半。
+local COMMENT_PAGE_SIZE_MAX = 50
 local COMMENT_PAGE_SIZE = 20
 -- The bff shelf validates pageSize >= 1 (not >= 20 like the legacy list
 -- endpoints). The web client defaults to 50, so match it.
@@ -328,6 +330,13 @@ local function redirect_target(original_url, location)
     end
     -- 只允许站内重定向：图片 URL 带站点签名，但盲目跟随会把请求打到任意主机。
     local target_host = target:match("^https?://([^/]+)") or ""
+    local original_host = original_url:match("^https?://([^/]+)") or ""
+    -- 同主机重定向（几乎都是 http→https 升级）放行：目标域名没变，安全边界不动。
+    -- 2026-10-27《游戏人生》实测：photobucket 全库插图都是 301 到自己 https，
+    -- 被旧策略判成 "redirect unusable"，整批图取不回来。
+    if target_host ~= "" and target_host == original_host then
+        return target
+    end
     if target_host == "lightnovel.fun" or target_host:find("%.lightnovel%.fun$") then
         return target
     end
@@ -567,6 +576,34 @@ function Client:fetchWebBookVolumes(book_id, page, options)
         pageSize = LIST_PAGE_SIZE,
         page_size = LIST_PAGE_SIZE,
     }, {
+        timeout = options.timeout or 40,
+        base_url = BFF_BASE_URL,
+        headers = {
+            ["User-Agent"] = WEB_UA,
+            ["Origin"] = "https://www.lightnovel.fun",
+            ["Referer"] = "https://www.lightnovel.fun/",
+        },
+    })
+end
+
+--- 新内容书籍的按卷评论（公开接口，无需登录）。
+---
+--- 2026-10-27 实测：`POST /api/new-content-read/get-book-comments`
+--- `{book_id, volume_id, page, page_size}`，page_size 可到 50，page_info.count 与站点
+--- 书架上的 volume_comment_count 逐卷相等（499/499、273/273、779/779）。不传
+--- volume_id 时返回"全书评论"（通常只有寥寥几条）。这条路径让没有 legacy 文章 id
+--- 的书也能拿到评论，不必再依赖白名单或运行时核验。
+function Client:fetchBookComments(book_id, volume_id, page, options)
+    options = options or {}
+    local body = {
+        book_id = tonumber(book_id) or book_id,
+        page = tonumber(page) or 1,
+        page_size = COMMENT_PAGE_SIZE_MAX,
+        pageSize = COMMENT_PAGE_SIZE_MAX,
+    }
+    local vid = tonumber(volume_id)
+    if vid and vid > 0 then body.volume_id = vid end
+    return self:callFlat("/api/new-content-read/get-book-comments", body, {
         timeout = options.timeout or 40,
         base_url = BFF_BASE_URL,
         headers = {

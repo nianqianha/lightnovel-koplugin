@@ -62,7 +62,8 @@ function TaskDialog:init()
     self.state = "running"
     self.percentage = 0
     self.progress_total = tonumber(self.progress_total) or 0
-    self.last_redraw_time_ms = 0
+    self.last_redraw_at = 0
+    self.shown_at = nil
     self.width = Screen:getWidth() - Screen:scaleBySize(80)
 
     self.title_widget = TextWidget:new{
@@ -164,14 +165,24 @@ end
 function TaskDialog:_redraw(force)
     local now = time.now()
     if not force then
-        local elapsed = now - self.last_redraw_time_ms
-        if elapsed < self.refresh_time_seconds * 1000 * 1000 then return false end
+        -- b38：time.now() 是 `time.monotonic_coarse`，单位**秒**（frontend/ui/time.lua
+        -- 里 `time.now = time.monotonic_coarse`）。这里原来拿它去比较
+        -- `refresh_time_seconds * 1000 * 1000`（微秒），阈值变成 1e6 秒——于是
+        -- 非 force 的刷新永远被拦掉：进度条、状态行、标题全都不重绘，读者看到的
+        -- 就是"弹窗卡住/进度不动"。改成直接比秒。
+        if now - self.last_redraw_at < self.refresh_time_seconds then
+            return false
+        end
     end
-    self.last_redraw_time_ms = now
+    self.last_redraw_at = now
     if force then
         UIManager:setDirty(self, function() return "full", self.dimen end)
     else
-        UIManager:setDirty(self, function() return "fast", self.dimen end)
+        -- b37：进度 tick 用 "ui" 而不是 "fast"。这台机器上装了自己的翻页补丁
+        -- （2-zz-pageturn-fast.lua 的 DU 强制段），fast 局部刷新会把弹窗擦成
+        -- 空白/残影，读者看到的就是"弹窗一闪就没了"，而下一帧只在 force 时
+        -- 回来。ui 是 KOReader 里对话框的标准刷新类型：局部、不抖动、不擦字。
+        UIManager:setDirty(self, function() return "ui", self.dimen end)
     end
     return true
 end
@@ -216,9 +227,23 @@ function TaskDialog:reportProgress(state)
     if self.progress_bar and self.progress_bar.setPercentage then
         self.progress_bar:setPercentage(self.percentage)
     end
+    -- 阶段名：读者要的是"现在在干什么"，只给 300/392 还是看不出阶段。
+    local STAGE_LABEL = {
+        catalog = _("获取目录"),
+        export_route = _("取回正文"),
+        image_fetch_start = _("下载插图"),
+        image = _("下载插图"),
+        prefetch = _("预取插图"),
+        chapter = _("整理章节"),   -- 渲染/清洗正文，不是打 zip
+        pack = _("打包 EPUB"),
+        page = _("抓取评论"),
+    }
     local parts = {}
     if done and total then
         parts[#parts + 1] = tostring(done) .. "/" .. tostring(total)
+    end
+    if state.stage and STAGE_LABEL[state.stage] then
+        parts[#parts + 1] = STAGE_LABEL[state.stage]
     end
     if written then parts[#parts + 1] = _("已缓存 %s 个"):format(tostring(written)) end
     if failed and failed > 0 then
@@ -262,6 +287,10 @@ function TaskDialog:setState(state)
 end
 
 function TaskDialog:show()
+    -- b38：记下显示时刻。实测有弹窗刚出来就自己消失的情况（crash.log
+    -- 18:30:02 打开 → 18:30:03 就 onHide），那是打开它的那次点击被重复派发、
+    -- 落到了同一位置的「隐藏」按钮上。1 秒内忽略隐藏请求。
+    self.shown_at = time.now()
     UIManager:show(self, "ui")
 end
 
@@ -274,6 +303,12 @@ end
 -- running job, so a silent no-op here would be indistinguishable from a broken
 -- button.
 function TaskDialog:onHide()
+    local since = self.shown_at and (time.now() - self.shown_at) or 99
+    if since < 1.0 then
+        logger.info("task dialog: ignoring hide right after show, dt=",
+            string.format("%.2f", since))
+        return
+    end
     logger.info("task dialog: hidden, job keeps running")
     local _t0 = os.clock()
     local ok, err = pcall(function()

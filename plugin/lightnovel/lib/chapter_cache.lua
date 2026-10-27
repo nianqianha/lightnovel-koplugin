@@ -159,7 +159,10 @@ function Cache:list_cached_books()
             local cok, citer, cobj = pcall(lfs.dir, self:_book_dir(name) .. "/chapters")
             if cok and type(citer) == "function" then
                 for _f in citer, cobj do
-                    chapters = chapters + 1
+                    -- 与菜单同口径：只数 .html，别把 .format 标记算成章节。
+                    if _f ~= "." and _f ~= ".." and _f:sub(-5) == ".html" then
+                        chapters = chapters + 1
+                    end
                 end
             end
             if chapters > 0 then
@@ -217,7 +220,54 @@ function Cache:chapter_path(key, aid)
     return self:_book_dir(key) .. "/chapters/" .. tostring(tonumber(aid) or 0) .. ".html"
 end
 
+-- 章节 XHTML 的格式版本（b40）。
+--
+-- 正文抽取一改（这次是去 BBCode），磁盘上已经烘好的章节不会自己更新：
+-- is_cached 只看文件在不在，于是"下载入库"认为都齐了、一个都不重下，读者
+-- 屏幕上还是旧的 `[justify]`。加一个 per-book 标记文件，版本不符就按未缓存
+-- 处理，下次下载自动重取。改抽取逻辑时记得把这个数字加一。
+local CHAPTER_HTML_VERSION = 2
+
+function Cache:_format_marker(key)
+    return self:_book_dir(key) .. "/chapters/.format"
+end
+
+function Cache:format_ok(key)
+    self._format_cache = self._format_cache or {}
+    -- 只缓存"确认有效"的结果。原来连 false 也缓存，而父进程往往在下载*之前*
+    -- 就查过一次（那时还没有 .format 标记）——下载写完后仍是同一个 Cache 实例，
+    -- 于是 is_cached 永远返回 false，导出阶段把 15 章全判成"未缓存"并逐章重新
+    -- 联网抓取（实测日志 `skipped_uncached= 15`），又慢又白做一遍网络。
+    -- 现在 false 不落缓存：多一次 io.open，换来的是不会因为一次早查而永久误判。
+    if self._format_cache[key] == true then return true end
+    local f = io.open(self:_format_marker(key), "r")
+    local ok = false
+    if f then
+        local version = tonumber(f:read("*n"))
+        f:close()
+        ok = version == CHAPTER_HTML_VERSION
+    end
+    if ok then self._format_cache[key] = true end
+    return ok
+end
+
+function Cache:mark_format(key)
+    self:_book_dir(key, true)
+    local path = self:_format_marker(key)
+    local tmp = path .. ".tmp"
+    local f = io.open(tmp, "w")
+    if f then
+        f:write(tostring(CHAPTER_HTML_VERSION) .. "\n")
+        f:close()
+        os.remove(path)
+        os.rename(tmp, path)
+        self._format_cache = self._format_cache or {}
+        self._format_cache[key] = true
+    end
+end
+
 function Cache:is_cached(key, aid)
+    if not self:format_ok(key) then return false end
     return lfs.attributes(self:chapter_path(key, aid), "mode") == "file"
 end
 
@@ -435,6 +485,39 @@ end
 --- Content.paragraphs_to_html() instead.
 ---
 --- @param book {book_id, key, title}
+--- 网络层瞬时错误的有限重试。
+---
+--- `Cannot assign requested address`（EADDRNOTAVAIL）是设备建不出 socket 时的典型
+--- 瞬时错误：WiFi 刚断/刚重连，或短时间内打开了太多连接。2026-10-27《游戏人生》
+--- 重出时正好撞上，直接判 `catalog_failed` 让整轮作废——而这只是一次 2 秒的抖动。
+--- 只重试连接层错误；业务错误（接口返回 code != 0）立即返回，不掩盖真问题。
+local function is_transient_net_error(err)
+    local t = tostring(err or ""):lower()
+    return t:find("cannot assign requested address", 1, true) ~= nil
+        or t:find("request_failed", 1, true) ~= nil
+        or t:find("connection reset", 1, true) ~= nil
+        or t:find("connection refused", 1, true) ~= nil
+        or t:find("timeout", 1, true) ~= nil
+end
+
+local function with_net_retry(fn, tries)
+    tries = tries or 3
+    local last
+    for attempt = 1, tries do
+        local data, err = fn()
+        if data then return data end
+        last = err
+        if not is_transient_net_error(err) then return nil, err end
+        if attempt < tries then
+            logger.warn("catalog: transient net error, retrying attempt=",
+                tostring(attempt), tostring(err))
+            local ok, ffiutil = pcall(require, "ffi/util")
+            if ok and ffiutil.sleep then ffiutil.sleep(2) end
+        end
+    end
+    return nil, last
+end
+
 --- Read the canonical web volume/chapter catalog with all pages.
 --- Returns flat rows plus declared totals; no unlock endpoint is used.
 function Cache:fetch_web_catalog(client, book_id, context)
@@ -450,8 +533,9 @@ function Cache:fetch_web_catalog(client, book_id, context)
         if context.emit then
             context.emit{ stage = "catalog", page = page }
         end
-        local data, err = client:fetchWebBookVolumes(book_id, page,
-            { timeout = 40 })
+        local data, err = with_net_retry(function()
+            return client:fetchWebBookVolumes(book_id, page, { timeout = 40 })
+        end)
         if not data then return nil, "volumes_failed:" .. tostring(err) end
         local rows = data.list or {}
         for _, volume in ipairs(rows) do
@@ -484,8 +568,10 @@ function Cache:fetch_web_catalog(client, book_id, context)
                 context.emit{ stage = "catalog", volume = volume_index,
                     total_volumes = #volumes, page = page_no }
             end
-            local data, err = client:fetchWebVolumeChapters(book_id, vid,
-                page_no, { timeout = 45 })
+            local data, err = with_net_retry(function()
+                return client:fetchWebVolumeChapters(book_id, vid, page_no,
+                    { timeout = 45 })
+            end)
             if not data then
                 return nil, string.format("volume_chapters_failed:%d:%s",
                     vid, tostring(err))
@@ -853,6 +939,7 @@ function Cache:download_web_catalog_book(client, book, context)
         local ok, werr = Content.write_atomic(self:chapter_path(key, id), xhtml)
         if ok then
             written_ids[#written_ids + 1] = id
+            if not self:format_ok(key) then self:mark_format(key) end
             return true
         end
         logger.err("download write failed", tostring(id), tostring(werr))
@@ -885,6 +972,14 @@ function Cache:download_web_catalog_book(client, book, context)
         logger.info("download: free export route allowed; revision=",
             export_revision, "requested=", tostring(#requested_ids))
         if context.checkCancelled then context.checkCancelled() end
+        -- 这一步是**一次性取回全部章节正文**（服务端整本导出路由，超时 300 秒），
+        -- 期间没有任何 done/total 可报。原来一句话都不说，弹窗从"正在获取目录"
+        -- 直接静默到好几分钟，读者只会理解成"卡死了/失败了"。
+        if context.emit then
+            context.emit{ stage = "export_route",
+                message = string.format("正在一次性取回 %d 章正文（最长 5 分钟）",
+                    #requested_ids) }
+        end
         local data, derr = client:fetchBookDownloadChapters(book_id, requested_ids,
             { timeout = 300 })
         if not data or type(data.list) ~= "table" then

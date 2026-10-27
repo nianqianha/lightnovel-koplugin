@@ -143,6 +143,40 @@ function Content.comment_image_urls(value)
     return urls
 end
 
+--- 站点正文里混着 BBCode：`[justify]…[/justify]`、`[b]`、`[color=#fff]`…
+---
+--- 2026-10-26 读者截图实测：整段正文前面挂着字面的 "[justify]"，正文里还夹着
+--- `[justify] [/justify]` 这种空行标记。原因是**只有** comment_plain_text 会去标记，
+--- 正文的两条路径（text_to_html / paragraphs_to_html）都没有，于是原样进了章节
+--- XHTML 和 EPUB。
+---
+--- 这里只做"去标记、留内容"：调用方的输出随后要逐段 xml_escape，塞真 HTML 进去
+--- 会被转义成可见文本。所以 [b]/[i] 这类只丢弃标记（丢失粗斜体是可接受的代价），
+--- 只有真正的换行类标记（[br]/[p]/[hr]）换成换行符，避免把两段黏成一段。
+--- 未知的方括号保持原样——正文里本来就有 `[注]` 这类合法方括号，不能一律删。
+local BBCODE_DROP = {
+    justify = true, center = true, left = true, right = true, align = true,
+    b = true, i = true, u = true, s = true, del = true, strike = true,
+    em = true, strong = true, color = true, backcolor = true, size = true,
+    font = true, highlight = true, quote = true, code = true, spoiler = true,
+    indent = true, sup = true, sub = true, url = true, email = true,
+    list = true, li = true, table = true, tr = true, td = true, th = true,
+}
+local BBCODE_BREAK = { br = true, p = true, hr = true }
+
+function Content.strip_bbcode(text)
+    local out = tostring(text or "")
+    -- 图片先摘出来：把 [img]URL[/img] 还原成裸 URL，交给调用方既有的图片识别。
+    out = out:gsub("%[img[^%]]*%]%s*(.-)%s*%[/img%]", " %1 ")
+    out = out:gsub("%[/?([A-Za-z][%w_]*)[^%]]*%]", function(name)
+        local n = name:lower()
+        if BBCODE_BREAK[n] then return "\n" end
+        if BBCODE_DROP[n] then return "" end
+        return nil -- 未知标记原样保留
+    end)
+    return out
+end
+
 function Content.comment_plain_text(value)
     local text = Content.decode_entities(Content.decode_entities(
         tostring(value or "")))
@@ -201,7 +235,7 @@ local IMG_MARK = "\1img\1"
 
 --- Convert plain text into paragraph HTML, turning bare image URLs into <img>.
 function Content.text_to_html(text)
-    local body = strip_leading_toc(Content.decode_entities(text or ""))
+    local body = strip_leading_toc(Content.strip_bbcode(Content.decode_entities(text or "")))
     body = body:gsub("\r\n", "\n"):gsub("\r", "\n")
 
     local out = {}
@@ -264,7 +298,7 @@ function Content.paragraphs_to_html(paragraphs, resources)
         if type(text) ~= "string" then
             text = tostring(text or "")
         end
-        text = Content.decode_entities(text)
+        text = Content.strip_bbcode(Content.decode_entities(text))
         text = text:gsub("%[res%]ext:([%w_%-]+)%[/res%]", function(key)
             local item = resources[key]
             local url = type(item) == "table"
@@ -393,6 +427,9 @@ function Content.chapter_body_html(detail, paragraphs)
     if type(snapshot) == "table" then
         local html = snapshot.body_html
         if type(html) == "string" and html:match("<%s*[PpHhIi]") then
+            -- 服务端渲染的 HTML 里也见过 BBCode 混排，同一套去皮先跑一遍；
+            -- 输出进的是 XML，不能把标记留给 crengine 当正文。
+            html = Content.strip_bbcode(html)
             local resources = Content.resource_map(detail)
             return (html:gsub("%[res%]ext:([%w_%-]+)%[/res%]", function(key)
                 local item = resources[key]

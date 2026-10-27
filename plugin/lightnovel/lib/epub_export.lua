@@ -140,11 +140,106 @@ local function url_cache_name(url)
     return string.format("%08x", h)
 end
 
+--- 图片 host 白名单（唯一事实来源：预取阶段与 build 期改写共用）。
+--- 只放站点自己的图床/域名：评论正文允许用户塞任意 <img src>，无差别抓取
+--- 等于让 EPUB 替第三方发请求，所以这里按域名逐个放行。
+--- `lsky-pro.shiinayuki.com` 是站点 2026-10 起给部分卷用的兰空图床
+--- （实测《义妹生活》63-67 章共 118 张），链接不带签名、匿名可读。
+-- 白名单版本号。**每次改 image_host_allowed 都要 +1**：
+-- export_status 里记着上次导出用的是哪一版；版本不同就算"上次缺图可修"，
+-- 「库中书更新」会自动重出一遍。否则改了白名单，旧状态仍写着 unsupported=41，
+-- 更新只会回"已是最新"，那批图永远补不进来。
+local IMAGE_WHITELIST_VERSION = 3
+Export.IMAGE_WHITELIST_VERSION = IMAGE_WHITELIST_VERSION
+
+local function image_host_allowed(host)
+    -- 默认放行任意图床（2026-10-27 改）。原因：一本书一个图床，代码里的白名单
+    -- 永远追不完——这一天里就陆续冒出 photobucket 的编号子域、sfeomoe、tietuku、
+    -- imgur 四家，每次都要改代码再发版。图像 URL 本来就出自站点自己的正文，
+    -- 逐 host 熔断（连续 6 张失败且从未成功）也会挡住整体不可达的站点。
+    -- 想要旧行为的读者可在设置里打开「图床限制」，届时只用下面这份白名单。
+    local strict = G_reader_settings
+        and G_reader_settings:isTrue("LightNovel_strict_image_hosts")
+    if not strict then
+        return true
+    end
+    if host == "api.lightnovel.fun"
+        or host == "static.lightnovel.fun" or host == "res.lightnovel.fun"
+        or host == "www.lightnovel.fun" or host == "lightnovel.fun"
+        or host == "i.noire.cc"
+        or host == "lsky-pro.shiinayuki.com" then
+        return true
+    end
+    -- photobucket 的编号子域（i1303./i1153./i66. 等）。2026-10-27《游戏人生》
+    -- 实测 20+ 张插图因 host 不在白名单被整片拒掉（日志成片
+    -- `refusing image host i1303.photobucket.com`），书里对应插图永久缺失。
+    -- 站点正文自己就引用这些 URL，按域放行。
+    if host == "photobucket.com"
+        or host:match("^[%w%-]+%.photobucket%.com$") then
+        return true
+    end
+    -- 2026-10-27 从 crash.log 统计出的其余被拒图床：
+    -- sfeomoe.com ×17、i3.tietuku.com ×4、i.imgur.com ×1。
+    -- 都是站点正文里自己引用的图，按域放行；新出现的会在日志里继续以
+    -- `refusing image host` 出现，按需再加，不放开通配。
+    if host == "sfeomoe.com" or host:match("^[%w%-]+%.sfeomoe%.com$") then
+        return true
+    end
+    if host == "tietuku.com" or host:match("^[%w%-]+%.tietuku%.com$") then
+        return true
+    end
+    if host == "imgur.com" or host == "i.imgur.com" then
+        return true
+    end
+    return false
+end
+
+--- 逐 host 熔断状态（每次 build 清零）。一个整体不可达的图床
+--- （118 张 × 2 候选 × 2 次 × 20s）会白白拖满整个导出；连续失败 6 张、
+--- 且该 host 从未成功过，就直接跳过剩余 URL，留给占位符并在日志里说清楚。
+--- 阈值取 6 而不是 3：开头几张偶发超时不该判死一个新图床（lsky 实测
+--- 106 张里有 8 张是站点自己 404，成功过的 host 不会被熔断）。
+local host_state = {}
+
+--- 把本次导出的插图健康度写到 bookDir/export_status.lua：
+--- `cacheWholeBook` 收尾会调用，供「库中书更新」判断上次导出是不是缺图。
+--- 之前只有日志，读者点更新只会看到"已是最新"，缺图的书永远修不回来。
+local function write_export_status(dir, st)
+    if not dir then return end
+    local path = dir .. "/export_status.lua"
+    local f = io.open(path, "wb")
+    if not f then
+        logger.warn("export: cannot write status", tostring(path))
+        return
+    end
+    local rows = {}
+    for i, m in ipairs(st.missing or {}) do
+        if i > 120 then break end
+        rows[#rows + 1] = string.format("{ url = %q, reason = %q }",
+            tostring(m.url or ""), tostring(m.reason or ""))
+    end
+    f:write(string.format(
+        "return { total = %d, fetched = %d, failed = %d, unsupported = %d, at = %d, whitelist = %d, missing = { %s } }\n",
+        st.total or 0, st.fetched or 0, st.failed or 0,
+        st.unsupported or 0, os.time(), IMAGE_WHITELIST_VERSION,
+        table.concat(rows, ", ")))
+    f:close()
+end
+
 --- 抓取一个插图 URL：磁盘缓存优先（b28），未命中走候选×2 次网络重试（b20 的
 --- 重定向跟随在 client:get 内），成功原子落缓存。预取阶段（b29）与 build 期
 --- gsub 回调共用本函数，保证两条路径行为一致。
 --- @return string|nil bytes, string|nil err, string|nil ext
 local function fetch_image_bytes(client, url, image_cache_dir, on_progress)
+    local host = url:match("^https?://([^/:]+)")
+    local st = host and host_state[host] or nil
+    if host and not st then
+        st = { ok = 0, fail = 0 }
+        host_state[host] = st
+    end
+    if st and st.ok == 0 and st.fail >= 6 then
+        return nil, "host_tripped"
+    end
     local bytes, err, ext
     local cache_file = image_cache_dir
         and (image_cache_dir .. "/" .. url_cache_name(url)) or nil
@@ -160,7 +255,10 @@ local function fetch_image_bytes(client, url, image_cache_dir, on_progress)
             end
         end
     end
-    if bytes then return bytes, nil, ext end
+    if bytes then
+        if st then st.ok = st.ok + 1 end
+        return bytes, nil, ext, cache_file
+    end
     local candidates = { url }
     if url:find("i.noire.cc:332", 1, true) then
         candidates[#candidates + 1] = url:gsub("i%.noire%.cc:332", "i.noire.cc")
@@ -174,7 +272,7 @@ local function fetch_image_bytes(client, url, image_cache_dir, on_progress)
             if on_progress then
                 on_progress("image_fetch_start", url)
             end
-            bytes, err = client:get(candidate, { timeout = 20 })
+            bytes, err = client:get(candidate, { timeout = 12 }) -- 12s：单张正常 <2s，20s 只会让死链多等一倍
             if bytes then ext = image_extension(bytes) end
             if bytes and ext and #bytes <= 8 * 1024 * 1024 then break end
             bytes, ext = nil, nil
@@ -193,14 +291,24 @@ local function fetch_image_bytes(client, url, image_cache_dir, on_progress)
             end
         end)
     end
-    return bytes, err, ext
+    if st then
+        if bytes and ext then st.ok = st.ok + 1 else st.fail = st.fail + 1 end
+    end
+    -- 第 4 个返回值是"可用的磁盘缓存路径"：调用方据此只留路径、不留字节，
+    -- 否则整本 120MB 插图会在 build 期同时驻留内存（b34 的 low_memory 根因）。
+    local saved = bytes and ext and cache_file
+        and lfs.attributes(cache_file) ~= nil
+    return bytes, err, ext, saved and cache_file or nil
 end
 
 rewrite_image_urls = function(body, client, assets, image_urls, on_progress,
-    image_cache_dir)
+    image_cache_dir, skip_urls, missing_out)
     if type(body) ~= "string" then return "" end
     local fetched = 0
     local failed = 0
+    -- 被白名单挡下的数量单独记：这类失败重导多少次都不会好，只能改代码，
+    -- 所以「库中书更新」不能把它当成需要重建的信号。
+    local unsupported = 0
     return (body:gsub('(<img[^>]-src%s*=%s*")([^"]+)(")',
         function(prefix, source, suffix)
             local url = Content.decode_entities(source):gsub("%)$", "")
@@ -214,45 +322,62 @@ rewrite_image_urls = function(body, client, assets, image_urls, on_progress,
             -- those nine from the EPUB while every other image in the same book
             -- was embedded. The signed URL is used verbatim, exactly as the
             -- listing handed it over; nothing is rewritten or guessed.
-            local allowed = host == "api.lightnovel.fun"
-                or host == "static.lightnovel.fun" or host == "res.lightnovel.fun"
-                or host == "www.lightnovel.fun" or host == "lightnovel.fun"
-                or host == "i.noire.cc"
-            if not allowed then
+            if not image_host_allowed(host) then
                 logger.warn("export: refusing image host", tostring(host))
-                return '<span class="ln-image-placeholder">[图片来源不受支持]</span>'
+                unsupported = unsupported + 1
+                if missing_out then
+                    missing_out[#missing_out + 1] = { url = url,
+                        reason = "unsupported:" .. tostring(host) }
+                end
+                return ""
             end
             local existing = assets[url]
+            -- b35：预取阶段对同一 URL 已经按 2 候选×2 次重试过；正文阶段再等
+            -- 一遍纯属浪费（26 条死链曾让每次重出多花约 5 分钟、20s/次的空等）。
+            if not existing and skip_urls and skip_urls[url] then
+                failed = failed + 1
+                if missing_out then
+                    missing_out[#missing_out + 1] = { url = url,
+                        reason = "fetch_failed" }
+                end
+                return ""
+            end
             if not existing and client and type(client.get) == "function" then
                 local candidates = { url }
                 if url:find("i.noire.cc:332", 1, true) then
                     candidates[#candidates + 1] = url:gsub("i%.noire%.cc:332", "i.noire.cc")
                 end
-                local bytes, err, ext
+                local bytes, err, ext, cached_path
                 -- b28：先查磁盘缓存，命中免网络（重出版不再整批重下百张图，
                 -- 实测一次约 5 分钟）。损坏/不完整的缓存按未命中处理重抓。
                 -- b29：抓取细节抽到 fetch_image_bytes，与预取阶段共用。
-                bytes, err, ext = fetch_image_bytes(client, url,
+                -- b34：命中缓存时只留路径，字节随用随弃（见 write_epub）。
+                bytes, err, ext, cached_path = fetch_image_bytes(client, url,
                     image_cache_dir, on_progress)
                 if bytes and ext and #bytes <= 8 * 1024 * 1024 then
                     local n = 0
                     for _asset_key in pairs(assets) do n = n + 1 end
                     local name = string.format("inline-%04d%s", n + 1, ext)
-                    existing = { name = name, data = bytes, mime = select(2, image_extension(bytes)) }
+                    existing = { name = name, mime = select(2, image_extension(bytes)),
+                        cache = cached_path,
+                        data = not cached_path and bytes or nil }
                     assets[url] = existing
-                    fetched = fetched + 1
                 else
-                    failed = failed + 1
                     logger.warn("export: image unavailable or invalid", tostring(err),
-                        "url=", url)
+                        "host=", tostring(host), "url=", url)
                 end
             end
             if existing then
+                -- b36：命中已有 asset（绝大多数来自预取）也要计入 fetched。
+                -- 旧口径只数本次现抓的，于是 status 写成 total=52 failed=26，
+                -- 健康度判定看小样本以为一半图挂了，每次点更新都重出整本。
+                fetched = fetched + 1
                 if image_urls then image_urls[url] = existing.name end
                 return prefix .. "../images/" .. existing.name .. suffix
             end
-            return '<span class="ln-image-placeholder">[图片暂不可用]</span>'
-        end)), fetched, failed
+            failed = failed + 1
+            return ""
+        end)), fetched, failed, unsupported
 end
 
 --- Signature-detection for the embedded cover. Same rule as weread: an
@@ -278,7 +403,21 @@ image_extension = function(data)
 end
 
 --- Write the archive. Verbatim from weread, including the two quirks above.
-local function write_epub(path, entries)
+--- b34：条目可以只给磁盘路径（entry.path），逐条读入、写完即弃。
+--- b35：每 10 条记一次 /proc/meminfo 的可用内存，并在打包中途强制 GC；
+---      worker 在写包时静默死亡（16:12 那次 worker_no_result），需要这条曲线
+---      判断到底是内存被杀还是别的。
+local function available_memory_kb()
+    local f = io.open("/proc/meminfo", "r")
+    if not f then return nil end
+    local text = f:read("*a")
+    f:close()
+    local avail = text:match("MemAvailable:%s*(%d+)")
+        or text:match("MemFree:%s*(%d+)")
+    return tonumber(avail)
+end
+
+local function write_epub(path, entries, ctx)
     local Archiver = require("ffi/archiver")
     local archive = Archiver.Writer:new{}
     local part_path = path .. ".part"
@@ -292,10 +431,55 @@ local function write_epub(path, entries)
         assert(archive:addFileFromMemory("mimetype", "application/epub+zip",
             mtime), archive.err)
         assert(archive:setZipCompression("deflate"), archive.err)
-        for _, entry in ipairs(entries) do
-            local added = archive:addFileFromMemory(entry.name, entry.data or "",
-                mtime)
+        for i, entry in ipairs(entries) do
+            -- b34：图片条目只带磁盘路径，这里读一张、写一张、丢一张。
+            -- 整本 120MB 插图如果一次性放进 entries，Kindle 直接 OOM。
+            local data = entry.data
+            if not data and entry.path then
+                local f = io.open(entry.path, "rb")
+                if f then
+                    data = f:read("*a")
+                    f:close()
+                end
+            end
+            if not data then
+                logger.warn("export: entry has no bytes", tostring(entry.name),
+                    "path=", tostring(entry.path))
+                data = ""
+            end
+            -- 图片（JPEG/WebP/GIF/PNG）本身已是压缩格式，再 deflate 一遍只烧 CPU：
+            -- 实测一本 63MB 的书 392 个条目里约 320 张图，打包阶段要跑近两分钟。
+            -- 改成 store 直接搬字节，包体积基本不变（图片本来就压不动），CPU 省一大截。
+            if entry.name:match("%.[Jj][Pp][Ee]?[Gg]$")
+                or entry.name:match("%.[Pp][Nn][Gg]$")
+                or entry.name:match("%.[Gg][Ii][Ff]$")
+                or entry.name:match("%.[Ww][Ee][Bb][Pp]$")
+                or entry.name:match("%.[Bb][Mm][Pp]$") then
+                archive:setZipCompression("store")
+            else
+                archive:setZipCompression("deflate")
+            end
+            local added = archive:addFileFromMemory(entry.name, data, mtime)
             assert(added, archive.err or ("failed to add " .. tostring(entry.name)))
+            data = nil
+            entry.data = nil
+            if i % 10 == 0 then
+                collectgarbage("collect")
+                logger.info("export: write", tostring(i), "/",
+                    tostring(#entries), "free_kb=",
+                    tostring(available_memory_kb()), entry.name)
+                -- 打包阶段原本只写日志、不给父进程任何进度：392 个条目、约两分钟，
+                -- 弹窗停在"正在导出"一动不动，读者只能判断成卡死（实测 01:04–01:05
+                -- 每 10 条写一条日志，界面上什么都没有）。
+                if ctx and type(ctx.emit) == "function" then
+                    ctx.emit{ stage = "pack", done = i, total = #entries }
+                end
+                -- 给内核回写留口气：一次连写几十 MB 会把 dirty page 堆到
+                -- MemAvailable 见底，Kindle 的 OOM killer 就挑这个 fork 杀。
+                if ctx and type(ctx.sleep) == "function" then
+                    pcall(ctx.sleep, 0.1)
+                end
+            end
         end
     end, debug.traceback)
     pcall(function() archive:close() end)
@@ -651,6 +835,7 @@ end
 function Export:run(on_done)
     self.asset_map = {}
     self.image_urls = {}
+    self.prefetch_failed = {}
     local chapters = {}
     local missing = 0
     -- Split the shortfall. A LOCKED chapter that is not cached is genuinely
@@ -718,6 +903,8 @@ function Export:run(on_done)
     self.asset_map = {}
     self.image_urls = {}
     self.export_chapters = chapters
+    -- 每次导出重新统计各图床成败，避免上一次导出的熔断状态穿越到下一次。
+    host_state = {}
     local fragments = self:collect_fragments()
     local fragment_count = 0
     for _key, fragment in pairs(fragments) do
@@ -727,6 +914,7 @@ function Export:run(on_done)
     end
     self.asset_map = self.asset_map or {}
     self.image_urls = self.image_urls or {}
+    self.prefetch_failed = self.prefetch_failed or {}
     -- Deliberately NOT Cover.resolve(): resolve() returns the 240x360 shelf
     -- thumbnail first because that is what a 90px shelf row wants. An EPUB cover
     -- is opened at full page width on a phone, so the original wins here and the
@@ -743,14 +931,13 @@ function Export:run(on_done)
     -- cancellation. Nil when the build runs inline (no worker available).
     local build_context = nil
 
-    -- b29：插图预取阶段——全书 URL 先收集、2 个协程并发抓取。
-    --
-    -- 串行抓一张 ~3s，百张 5 分钟；预取并发后约减半，且 build 期 gsub 回调
-    -- 全部命中内存 assets，正文阶段零网络。LuaSocket 的 http.request 是阻塞
-    -- 调用，双协程只能交替而非真并行；收益来自两张图的下载时间重叠（一次
-    -- ~3s 传输里大部分是网络等待）。每请求前后都有 emit 心跳，worker 的
-    -- 120s stale-kill 不会误判（最坏单图 2 候选×2 次×20s=80s < 120s）。
-    -- 失败的 URL 不进 assets，交给 build 期回调按原逻辑重试与记数。
+    -- b37：预取从 run() 移到 build() 里跑。原来它在父进程（UI 线程）里
+    -- 循环 325 次阻塞 socket，界面 6 分钟不响应：弹窗画不出来、点击全排队，
+    -- 读者看到的就是"弹窗一闪就没了、整机卡住、过一会儿才回来"。现在由
+    -- worker 子进程预取，每 5 条约一次 emit，弹窗能持续刷新进度。
+
+    local build = function()
+    -- b37：在子进程里先把全书插图抓/读进缓存，正文阶段零网络。
     local image_cache_dir = self.settings:bookDir(self.key) .. "/images"
     if self.client and type(self.client.get) == "function" then
         local urls, seen_urls = {}, {}
@@ -763,9 +950,7 @@ function Export:run(on_done)
                 for source in body:gmatch('<img[^>]-src%s*=%s*"([^"]+)"') do
                     local url = Content.decode_entities(source):gsub("%)$", "")
                     local host = url:match("^https?://([^/:]+)")
-                    if host == "api.lightnovel.fun" or host == "static.lightnovel.fun"
-                        or host == "res.lightnovel.fun" or host == "www.lightnovel.fun"
-                        or host == "lightnovel.fun" or host == "i.noire.cc" then
+                    if image_host_allowed(host) then
                         if not seen_urls[url] then
                             seen_urls[url] = true
                             urls[#urls + 1] = url
@@ -776,28 +961,42 @@ function Export:run(on_done)
         end
         if #urls > 0 then
             logger.info("export: prefetching images. urls=", tostring(#urls))
+            -- 先报一次"0/总数"。图片全在磁盘缓存时这一阶段几乎是瞬间完成的，
+            -- 只有每 5 张才报的规则会让它根本不出现，读者就会以为"根本没下载图片"。
+            if build_context then
+                build_context.emit{ stage = "prefetch", done = 0, total = #urls,
+                    message = string.format("预取插图 0/%d（已缓存的直接读盘）", #urls) }
+            end
             local cursor = 0
             local function prefetch_worker()
                 while true do
                     cursor = cursor + 1
                     local url = urls[cursor]
                     if not url then return end
-                    local bytes = fetch_image_bytes(self.client, url,
-                        image_cache_dir, nil)
-                    if bytes and #bytes <= 8 * 1024 * 1024 then
-                        local ext = image_extension(bytes)
-                        if ext then
-                            local n = 0
-                            for _k in pairs(self.asset_map) do n = n + 1 end
-                            self.asset_map[url] = {
-                                name = string.format("inline-%04d%s", n + 1, ext),
-                                data = bytes,
-                                mime = select(2, image_extension(bytes)),
-                            }
-                        end
+                    -- b34：只保留磁盘缓存路径，不把图片字节留在内存。整本
+                    -- 插图 120MB，build 期全部驻留会让 Kindle 的 worker fork
+                    -- 直接以 low_memory 失败（2026-10-26 义妹生活实测）。
+                    local bytes, _err, ext, cached_path = fetch_image_bytes(
+                        self.client, url, image_cache_dir, nil)
+                    if bytes and ext and #bytes <= 8 * 1024 * 1024 then
+                        local n = 0
+                        for _k in pairs(self.asset_map) do n = n + 1 end
+                        self.asset_map[url] = {
+                            name = string.format("inline-%04d%s", n + 1, ext),
+                            mime = select(2, image_extension(bytes)),
+                            cache = cached_path,
+                            data = not cached_path and bytes or nil,
+                        }
+                    else
+                        -- b35：死链记下来，正文阶段直接出占位符不再重试。
+                        self.prefetch_failed[url] = true
                     end
                     -- 让出执行权给另一个抓取协程；HTTP 阻塞期间另一协程无法
                     -- 运行，但对端下载与本地处理可以重叠，仍快于纯串行。
+                    if build_context and (cursor % 5 == 0) then
+                        build_context.emit{ stage = "prefetch",
+                            done = cursor, total = #urls }
+                    end
                     coroutine.yield()
                 end
             end
@@ -824,8 +1023,6 @@ function Export:run(on_done)
                 "urls=", tostring(#urls))
         end
     end
-
-    local build = function()
         -- No "mimetype" entry here on purpose. write_epub adds it itself, FIRST
         -- and uncompressed, because that is an OCF requirement. The old code had
         -- it in BOTH places, so every exported EPUB carried two mimetype entries
@@ -895,7 +1092,23 @@ function Export:run(on_done)
             end
         end
 
+        -- 本次导出的插图健康度：total = 成功 + 失败 + 被白名单拒。
+        -- 收尾写进 export_status.lua，「库中书更新」据此判断要不要重出。
+        local images_fetched, images_failed, images_unsupported = 0, 0, 0
+        -- 缺失插图清单（url + 原因），写进 export_status 供「库中书更新」判断与
+        -- 读者核对"到底缺了哪几张"。上限 120 条，避免状态文件无限膨胀。
+        local missing_assets = {}
         for index, chapter in ipairs(chapters) do
+            -- 2026-10-27 实测：15 章的书在 chapter 10 处子进程静默死亡
+            -- （worker_no_result，无 low_memory 记录 → 被系统 OOM 杀掉的可能性最大）。
+            -- build 阶段此前每章没有任何内存迹象，事后无从判断。这里每章主动回收
+            -- 一次并记下 free_kb，既能压低峰值，也能在下次失败时看到崩前的走势。
+            if index % 3 == 0 then
+                collectgarbage("collect")
+                logger.info("export: build chapter", tostring(index), "/",
+                    tostring(#chapters), "free_kb=",
+                    tostring(available_memory_kb()))
+            end
             local volume_id = tonumber(chapter.volume_id) or 0
             local volume_group
             if volume_id > 0 then
@@ -968,16 +1181,18 @@ function Export:run(on_done)
                         body = body:gsub(
                             '<p class="ln%-comment%-line">.-</p>', "")
                     end
-                    body = body:gsub("%[res%]ext:[%w_%-]+%[/res%]",
-                        '<span class="ln-image-placeholder">[插图资源不可用]</span>')
+                    -- b37：占位符不再进正文。读者要的是"看不到就不占版面"，
+                    -- 而一行灰字比空白更像故障；失效张数改为导出完成时统计。
+                    body = body:gsub("%[res%]ext:[%w_%-]+%[/res%]", "")
                     -- Single target on purpose: rewrite_image_urls also returns fetch counts, and
                     -- binding those instead left `body` holding the ORIGINAL markup
                     -- with its remote <img src> intact, so every illustration fell
                     -- back to a remote URL that cannot be read offline. The two
                     -- export tests caught exactly that.
                     -- b28: 传入本书插图缓存目录（bookDir/images），重出版免重下。
-                    body = rewrite_image_urls(body, self.client,
-                        self.asset_map, self.image_urls,
+                    local ch_fetched, ch_failed, ch_unsupported
+                    body, ch_fetched, ch_failed, ch_unsupported = rewrite_image_urls(
+                        body, self.client, self.asset_map, self.image_urls,
                         function(stage, url)
                             -- Heartbeat around every image request. Without it the
                             -- child can go silent for minutes and the parent reads
@@ -987,7 +1202,11 @@ function Export:run(on_done)
                                     total = #chapters, image = url }
                             end
                         end,
-                        self.settings:bookDir(self.key) .. "/images")
+                        self.settings:bookDir(self.key) .. "/images",
+                        self.prefetch_failed, missing_assets)
+                    images_fetched = images_fetched + (ch_fetched or 0)
+                    images_failed = images_failed + (ch_failed or 0)
+                    images_unsupported = images_unsupported + (ch_unsupported or 0)
                     local filename = string.format("text/chapter-%03d.xhtml",
                         index)
                     local id = "chapter_" .. tostring(index)
@@ -1029,10 +1248,19 @@ function Export:run(on_done)
             end
         end
         for url, asset in pairs(self.asset_map) do
+            -- b34：缓存命中的 asset 只带路径，类型从文件头 16 字节判断；
+            -- 内容在 write_epub 里逐个读入，内存里最多一张图。
             local ext, mime = image_extension(asset.data)
+            if not ext and asset.cache then
+                local f = io.open(asset.cache, "rb")
+                local head = f and f:read(16) or nil
+                if f then f:close() end
+                ext, mime = image_extension(head)
+            end
             if ext and mime then
                 entries[#entries + 1] = {
                     name = "OEBPS/images/" .. asset.name,
+                    path = asset.cache,
                     data = asset.data,
                 }
                 manifest[#manifest + 1] = string.format(
@@ -1090,7 +1318,16 @@ function Export:run(on_done)
             -- can show, rather than letting write_epub try to open a nil path.
             error("library_dir_unwritable", 0)
         end
-        write_epub(path, entries)
+        write_epub(path, entries, build_context)
+        -- 导出完就把插图健康度落盘：下一次点「库中书更新」时，若上次缺图
+        -- （例如整卷图床被白名单拒），这里会触发重出，读者不需要手动删书。
+        write_export_status(self.settings:bookDir(self.key), {
+            total = images_fetched + images_failed + images_unsupported,
+            fetched = images_fetched,
+            failed = images_failed,
+            unsupported = images_unsupported,
+            missing = missing_assets,
+        })
         -- Write the <name>.sdr/metadata.epub.lua sidecar too. Every book in the
         -- reader's library has one; without it KOReader has no title, no author
         -- and no document properties for a file it has never opened, and lists it

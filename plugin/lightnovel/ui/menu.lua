@@ -141,7 +141,8 @@ local function book_has_chapters(plugin, key)
         return false
     end
     for name in iter, dir_obj do
-        if name ~= "." and name ~= ".." then
+        -- 同上：只认真正的章节文件，别把 .format 当成一章。
+        if name ~= "." and name ~= ".." and name:sub(-5) == ".html" then
             return true
         end
     end
@@ -155,7 +156,11 @@ local function count_chapter_files(plugin, key)
     local ok, iter, dir_obj = pcall(lfs.dir, dir)
     if ok and type(iter) == "function" then
         for name in iter, dir_obj do
-            if name ~= "." and name ~= ".." then n = n + 1 end
+            -- 只数 .html：b40 之后 chapters/ 里有 .format 标记，数进去会导致
+            -- 「菜单说 2 本、点进去只有 1 本」。
+            if name ~= "." and name ~= ".." and name:sub(-5) == ".html" then
+                n = n + 1
+            end
         end
     end
     return n
@@ -296,8 +301,8 @@ function M.getLocalCacheItems(plugin)
     }
     if key_count > 0 then
         items[#items + 1] = {
-            text = _("清除缓存…"),
-            callback = safeCallback(_("清除缓存"), function()
+            text = _("管理缓存（可删单本）…"),
+            callback = safeCallback(_("管理缓存"), function()
                 M.showCacheManager(plugin)
             end),
         }
@@ -327,6 +332,19 @@ function M.showCachedBooks(plugin)
                     catalog = catalog,
                 }
             end
+        else
+            -- catalog.lua 缺失（旧版保存失败的遗留）也照样列出来：原来这种书在
+            -- 列表里直接消失，而菜单计数把它算进去 —— 就是"显示 2、点进去 1"。
+            local chapters = count_chapter_files(plugin, key)
+            if chapters > 0 then
+                rows[#rows + 1] = {
+                    key = key,
+                    title = key,
+                    text = string.format("%s  %s %d", key, _("已缓存章数"),
+                        chapters),
+                    catalog = nil,
+                }
+            end
         end
     end
     if #rows == 0 then
@@ -340,7 +358,13 @@ function M.showCachedBooks(plugin)
             -- Re-evaluated on every paint so a long title is not cached stale.
             text_func = function() return row.text end,
             callback = safeCallback(row.title, function()
-                plugin:showCachedToc(row.key, plugin.cache:load_catalog(row.key))
+                local catalog = plugin.cache:load_catalog(row.key)
+                if type(catalog) ~= "table" then
+                    UIManager:show(InfoMessage:new{
+                        text = _("这本书没有目录缓存，请在书架里重新打开一次。") })
+                    return
+                end
+                plugin:showCachedToc(row.key, catalog)
             end),
         }
     end
@@ -544,6 +568,29 @@ function M.showSettings(plugin)
             end),
         },
         {
+        {
+            -- 图床白名单总开关。默认开启（推荐）：只允许站点自己引用过的图床，
+            -- 免得正文里随便一个 URL（跟踪像素、早已关站的图床）都拖着设备去请求。
+            -- 关掉即"任意图床都允许"，代价是可能多等超时、也可能向陌生域名发请求。
+            text_func = function()
+                local strict = G_reader_settings
+                    and G_reader_settings:isTrue("LightNovel_strict_image_hosts")
+                return _("图床限制：")
+                    .. (strict and _("开启（只取已收录的图床）")
+                        or _("关闭（任意图床，推荐）"))
+            end,
+            callback = safeCallback(_("图床限制"), function()
+                local strict = G_reader_settings
+                    and G_reader_settings:isTrue("LightNovel_strict_image_hosts")
+                G_reader_settings:saveSetting("LightNovel_strict_image_hosts",
+                    not strict)
+                if G_reader_settings.flush then
+                    G_reader_settings:flush()
+                end
+                UIManager:close(menu)
+                M.showSettings(plugin)
+            end),
+        },
             -- The row itself is the feedback. An earlier version showed an
             -- InfoMessage and then immediately closed and reopened this menu,
             -- so the message covered the new list and the tap looked like a
@@ -710,18 +757,23 @@ function M.getMainMenuItems(plugin)
     -- the menu does not carry a permanently dead row.
     -- b22: 任务登记在模块级 STATE 里跨插件实例存活（阅读器 ⇄ 文件管理器切换
     -- 会重建实例），必须经 getTask() 读；直接读实例字段在切换后永远拿不到。
-    if plugin:getTask() then
-        items[#items + 1] = {
-            text_func = function()
-                local running = plugin:getTask()
-                return running and running.paused
-                    and _("任务进度（已暂停）") or _("任务进度")
-            end,
-            callback = safeCallback(_("任务进度"), function()
-                plugin:showTaskStatus()
-            end),
-        }
-    end
+    -- 常驻，不再按"有没有任务"决定是否出现。
+    --
+    -- 原来这一行只在 getTask() 非空时才挂上，而菜单表是在打开前重建的；读者
+    -- 一旦先关掉进度弹窗、再切到文件管理器，就可能看到一张**没有这一行**的菜单
+    -- （2026-10-27 读者报"关闭弹窗之后找不到任务进度，不是第一次"）。入口存在与否
+    -- 不该取决于一个会被跨实例重建的状态，所以改成always-on：没有任务时点进去
+    -- 会明确说"当前没有正在进行的任务"，比整行消失更容易理解。
+    items[#items + 1] = {
+        text_func = function()
+            local running = plugin:getTask()
+            if not running then return _("任务进度（无进行中的任务）") end
+            return running.paused and _("任务进度（已暂停）") or _("任务进度（正在运行）")
+        end,
+        callback = safeCallback(_("任务进度"), function()
+            plugin:showTaskStatus()
+        end),
+    }
 
     -- 反馈通道（b27）：遇到报错一键导出诊断日志到 documents，USB 取走发送。
     items[#items + 1] = {

@@ -34,6 +34,94 @@ local function force_wf_level_once()
     -- no-op since b38
 end
 
+-- b49 观测 + 队列后置修正 ------------------------------------------------
+--
+-- 事实（b48 日志）：同一轮翻页里图页先拿 wf=4（GLR16 灰阶），随后又被一次
+-- 全屏 wf=1（DU + FORCE_MONOCHROME）覆盖。b49 做两件事：
+--   ① 把"第二次 DU 是谁发的"钉死：每次全屏 _refresh 记序号 + 调用栈，
+--      驱动层 MECH 带同一序号 + 调用栈（只对 wf≠257 打，量很小）。
+--   ② 不再相信队列时刻的 img_count/img_coverage —— paintTo 之前它还是
+--      上一页的值 —— 改为在 paintTo **之后**、_repaint 真正下发**之前**
+--      用刚画完这页的 img_count 复查刷新队列，按需把 fast↔partial 互相修正。
+--      这一步与"谁是元凶"无关：哪怕没抓到源头，画质也能先修好。
+local FASTPAGE_LOG_ENTRY = 60
+local FASTPAGE_LOG_MECH = 60
+local FASTPAGE_LOG_FIX = 60
+local refresh_seq = 0
+local log_entry_left = FASTPAGE_LOG_ENTRY
+local log_mech_left = FASTPAGE_LOG_MECH
+local log_fix_left = FASTPAGE_LOG_FIX
+
+local function compact_stack(levels)
+    local ok, tb = pcall(debug.traceback, "", 3)
+    if not ok or type(tb) ~= "string" then return "?" end
+    tb = tb:gsub("^stack traceback:\n?", "")
+    local out = {}
+    for line in tb:gmatch("[^\n]+") do
+        line = line:gsub("^%s+", "")
+        if line ~= "" then
+            out[#out + 1] = line
+            if #out >= (levels or 6) then break end
+        end
+    end
+    return table.concat(out, " <- ")
+end
+
+local function reader_view()
+    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+    if not ok or not ReaderUI or not ReaderUI.instance then return nil end
+    return ReaderUI.instance.view
+end
+
+local function reader_page_has_images()
+    local view = reader_view()
+    if not view then return false end
+    -- KOpt（PDF/图片书）走 paging 分支，img_count 恒为 0，不能当"无图"用。
+    if view.ui and view.ui.paging then return false end
+    -- b50：优先用按页缓存的统计（img_count 同页重绘时会归 0，不可信）。
+    local st = view._fastpage_stats
+    if st then return (tonumber(st.count) or 0) > 0 end
+    return (tonumber(view.img_count) or 0) > 0
+end
+
+-- b50：按页缓存图片统计。
+--
+-- 实测（b49 日志）：同一页连续重绘时 crengine 的 drawCurrentPage() 会交替
+-- 返回 (1, 0.568) / (0, 0)。因为只有真正重新排版的那次才统计图片，同页原地
+-- 重绘只做 blit。拿 0 当"这页没图"就会把图页反复打回 DU（黑白）——读者看到的
+-- "先黑白再变灰"正是这个来回。
+-- 因此按页码缓存：页码变了才采信新值（换页时 crengine 必定重排），同页重绘
+-- 只在读到更大值时更新，绝不把已知的"有图"覆盖成 0。
+local function page_stats(view)
+    local page = -1
+    local ok, p = pcall(function() return view.document:getCurrentPage() end)
+    if ok and type(p) == "number" then page = p end
+    local cnt = tonumber(view.img_count) or 0
+    local cov = tonumber(view.img_coverage) or 0
+    local st = view._fastpage_stats
+    if not st or st.page ~= page then
+        st = { page = page, count = cnt, coverage = cov }
+        view._fastpage_stats = st
+    elseif cnt > (tonumber(st.count) or 0) then
+        st.count, st.coverage = cnt, cov
+    end
+    return st
+end
+
+local function region_is_fullscreen(region)
+    if not region then return true end
+    local Device = require("device")
+    local Screen = Device.screen
+    return region.w >= Screen:getWidth() - 2 and region.h >= Screen:getHeight() - 2
+end
+
+local function reader_on_top()
+    local view = reader_view()
+    if not view or not view.dialog then return false end
+    local UIManager = require("ui/uimanager")
+    return UIManager:getTopmostVisibleWidget() == view.dialog
+end
+
 -- b47 观测（只读，不改行为）：dump 驱动层波形常量的真实数值。
 --
 -- 前六轮全在猜 mode 名的语义，这次直接读实际映射：Screen.waveform_* 的
@@ -66,16 +154,23 @@ local function dump_waveforms_once()
     end)
     -- b48 终极观测：hook 驱动层 mech_refresh，打印实际送进驱动的波形数值。
     -- 这一步能直接看出"透传"到底送了什么波形给硬件，不再依赖上层推测。
+    -- b49：加刷新序号 + 调用栈（只对非 AUTO 的 wf 打栈，避免刷屏），
+    -- 这样每条 wf=1（DU）都能对回"是哪个 _refresh 调用点发的"。
     pcall(function()
         local Device = require("device")
         local Screen = Device.screen
         local orig_mech = Screen.mech_refresh
         if type(orig_mech) ~= "function" then return end
         Screen.mech_refresh = function(fb, is_flashing, waveform_mode, x, y, w, h, dither)
-            logger.info("fastpage MECH: wf=", tostring(waveform_mode),
-                " flashing=", tostring(is_flashing),
-                " dither=", tostring(dither),
-                " region=", tostring(w), "x", tostring(h))
+            local head = string.format("fastpage MECH R#%d wf=%s flashing=%s dither=%s region=%sx%s",
+                refresh_seq, tostring(waveform_mode), tostring(is_flashing),
+                tostring(dither), tostring(w), tostring(h))
+            if waveform_mode ~= 257 and log_mech_left > 0 then
+                log_mech_left = log_mech_left - 1
+                logger.info(head, " STACK: ", compact_stack(6))
+            else
+                logger.info(head)
+            end
             return orig_mech(fb, is_flashing, waveform_mode, x, y, w, h, dither)
         end
     end)
@@ -149,7 +244,8 @@ local function page_is_image_page(dither)
         logger.info("fastpage judge: img_count=", tostring(img_count),
             " coverage=", string.format("%.3f", coverage),
             " dithered=", tostring(dialog_dithered),
-            " dither_param=", tostring(dither))
+            " dither_param=", tostring(dither),
+            " drawn=", tostring(view.state and view.state.drawn))
     end
     -- b40（读者报"文字和图片共存的情况还是 DU"）：旧判定只看覆盖率
     -- ≥5%，文字+小图的页（图占屏 <5%）被判成纯文字页走 DU，小图被
@@ -162,6 +258,62 @@ local function page_is_image_page(dither)
     end
     return coverage >= IMAGE_COVERAGE_GL16
 end
+
+-- b49：paintTo 结束后按"刚画完这一页"的真值修正刷新队列。
+--
+-- 时序（uimanager.lua:1220-1321）：setDirty 先把 mode 写进 _refresh_stack →
+-- _repaint 先 paintTo（此时 readerview.lua:274 才把新页的 img_count /
+-- img_coverage 写进 view）→ 最后才按下发队列执行。也就是说队列里的 mode
+-- 是在**旧页数据**上做的决定。这里在 paintTo 返回的瞬间把队列重判一次：
+--   有图 → partial（MTK=GLR16 灰阶）；无图 → fast（MTK=DU 极速）。
+-- 只在阅读器是顶层窗口、且不在滚动中时生效，避免影响菜单/翻页动画。
+local function adjust_queued_refreshes(view, st)
+    if not enabled or du_on_images() then return end
+    -- 只对 CRe（EPUB）生效：KOpt 的 img_count 恒 0，降级会把 PDF 页面打成 1-bit。
+    if view.ui and view.ui.paging then return end
+    local UIManager = require("ui/uimanager")
+    if UIManager.currently_scrolling then return end
+    if not (view.dialog and UIManager:getTopmostVisibleWidget() == view.dialog) then
+        return
+    end
+    local stack = UIManager._refresh_stack
+    if type(stack) ~= "table" then return end
+    local img_count = st and tonumber(st.count) or 0
+    local coverage = st and tonumber(st.coverage) or 0
+    local want = img_count > 0 and "partial" or "fast"
+    for _, entry in ipairs(stack) do
+        local m = entry.mode
+        if (m == "partial" or m == "fast") and region_is_fullscreen(entry.region)
+            and m ~= want then
+            entry.mode = want
+            if want == "fast" then
+                -- DU + dither 在 MTK 上是 Y4 抖动（b41 实测发糊），必须清掉。
+                entry.dither = nil
+            end
+            if log_fix_left > 0 then
+                log_fix_left = log_fix_left - 1
+                logger.info(string.format(
+                    "fastpage FIX R#%d %s->%s page=%s img_count=%d coverage=%.3f STACK: %s",
+                    refresh_seq, m, want, tostring(st and st.page), img_count, coverage,
+                    compact_stack(6)))
+            end
+        end
+    end
+end
+
+pcall(function()
+    local ReaderView = require("apps/reader/modules/readerview")
+    local orig_paint_to = ReaderView.paintTo
+    if type(orig_paint_to) ~= "function" then return end
+    function ReaderView:paintTo(bb, x, y)
+        local r = orig_paint_to(self, bb, x, y)
+        pcall(function()
+            local st = page_stats(self)
+            adjust_queued_refreshes(self, st)
+        end)
+        return r
+    end
+end)
 
 local orig_refresh = UIManager._refresh
 -- b32：全刷计数只认翻页（读者要求"菜单/按键不整刷"）。
@@ -207,9 +359,22 @@ UIManager._refresh = function(self, mode, region, dither)
     dump_waveforms_once()
     -- b45 全链路打点：入口 mode / 是否带 region / currently_scrolling，
     -- 以及图页命中的最终 mode。一次翻页即可定案（前几轮靠猜浪费太多轮次）。
+    -- b49：加序号 + 调用栈（仅全屏刷新），把"第二次 DU 是谁发的"钉死。
+    refresh_seq = refresh_seq + 1
+    local seq = refresh_seq
     local mode_in, region_in, scroll_in = mode, region and "yes" or "no",
         tostring(self.currently_scrolling)
     local mode_out = "--"
+    if not region and log_entry_left > 0 then
+        log_entry_left = log_entry_left - 1
+        local entry_view = reader_view()
+        logger.info(string.format(
+            "fastpage R#%d in=%s dither=%s enabled=%s scroll=%s pageturn=%s",
+            seq, tostring(mode), tostring(dither), tostring(enabled),
+            tostring(self.currently_scrolling),
+            tostring(entry_view and entry_view._fastpage_is_page_turn)))
+        logger.info(string.format("fastpage R#%d STACK: %s", seq, compact_stack(7)))
+    end
     if enabled and mode == "partial" and not region then
         -- b43（读者改选画质）：图页走 full 整刷（GC16 灰阶，闪一下），
         -- 文字页走 DU 极速。
@@ -237,6 +402,10 @@ UIManager._refresh = function(self, mode, region, dither)
             -- 唯一需要防的：uimanager.lua:1130 在 currently_scrolling 为真时
             -- 把一切降 fast —— 清掉它，让真正的 partial(GLR16) 走到驱动。
             UIManager.currently_scrolling = false
+            -- b49：翻页标记在两个分支都要消费掉。旧版只在文字分支清，
+            -- 图页之后这个标记会一直挂着，把下一次全屏刷新误当成翻页。
+            local inst = reader_view()
+            if inst then inst._fastpage_is_page_turn = nil end
             return orig_refresh(self, mode, region, dither)
         elseif page_turn_hooked
             and (function()
@@ -266,8 +435,24 @@ UIManager._refresh = function(self, mode, region, dither)
             mode = "ui"
         end
     end
+    -- b49 队列期修正：只做 fast→partial（单方向）。
+    --
+    -- 这里 img_count 可能仍是上一页的值，所以只允许"往保守方向修"：
+    -- 一旦读到有图就升成 partial(灰阶)，绝不在这里把 partial 降成 fast
+    -- （降级只放在 paintTo 之后按新页真值做，见 adjust_queued_refreshes）。
+    if enabled and not du_on_images() and not region and not self.currently_scrolling
+        and mode == "fast" and reader_on_top() and reader_page_has_images() then
+        local fix_view = reader_view()
+        mode = "partial"
+        if log_fix_left > 0 then
+            log_fix_left = log_fix_left - 1
+            logger.info(string.format(
+                "fastpage FIXQ R#%d fast->partial img_count=%d STACK: %s",
+                seq, tonumber(fix_view and fix_view.img_count) or 0, compact_stack(6)))
+        end
+    end
     if mode ~= mode_in then
-        logger.info("fastpage refresh: ", mode_in, "(region=", region_in,
+        logger.info("fastpage refresh R#" .. seq .. ": ", mode_in, "(region=", region_in,
             ", scroll=", scroll_in, ") -> ", mode,
             " is_image_path=", tostring(mode == "flashui"))
     end
@@ -385,5 +570,6 @@ pcall(function()
 
     wrap(ReaderMenu, "reader")
     wrap(FileManagerMenu, "filemanager")
+    logger.info("pageturn-fast: b50 loaded (page-keyed image stats + traceback)")
     logger.info("pageturn-fast: menu entries installed (reader + filemanager, mono-only)")
 end)

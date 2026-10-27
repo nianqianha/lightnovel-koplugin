@@ -557,4 +557,146 @@ function Sync:refresh_one(aid, options)
     }
 end
 
+-- 新内容书籍的按卷评论（2026-10-27）。
+--
+-- 站点 `POST /api/new-content-read/get-book-comments {book_id, volume_id, page,
+-- page_size}` 是**公开**接口，计数与书架 volume_comment_count 逐卷相等
+-- （实测 499/499、273/273、779/779）。评论库按 `NEW_COMMENT_KEY_BASE + volume_id`
+-- 存档：legacy aid 都是小正数，不会撞。
+Sync.NEW_COMMENT_KEY_BASE = 900000000
+
+local function map_new_comment(item)
+    item = type(item) == "table" and item or {}
+    local author = item.author or {}
+    local level = author.level or {}
+    local stats = item.stats or {}
+    return {
+        tid = tostring(item.comment_id or item.commentId or ""),
+        user_info = {
+            nickname = author.nickname or item.nickname or "",
+            level = { name = level.name or item.levelName or "" },
+        },
+        content = tostring(item.content or ""),
+        likes = tonumber(item.likeCount) or tonumber(stats.likes) or 0,
+        replies = tonumber(item.replyCount) or tonumber(item.reply_count) or 0,
+        time = tostring(item.publishTime or item.publish_time
+            or item.dateText or ""),
+    }
+end
+
+--- 把一组卷的评论抓回来并入库。抓取在 worker 子进程，写库回到父进程
+--- （与 queue_background 相同的分工），UI 不会被网络请求卡住。
+--- @param volumes array of {volume_id=number, count=number}
+--- @return boolean queued, string|nil reason
+function Sync:queue_volumes(book_id, volumes, options)
+    options = options or {}
+    if type(volumes) ~= "table" or #volumes == 0 then
+        return false, "no_volumes"
+    end
+    if not self.worker:available() then
+        logger.err("comment sync (volumes): worker unavailable")
+        return false, "worker_unavailable"
+    end
+
+    local client = self.client
+    local book_dir = self:get_book_dir()
+    local store_namespace = sync_namespace(self)
+    local targets = {}
+    for _i, entry in ipairs(volumes) do
+        local vid = tonumber(entry and entry.volume_id)
+        if vid and vid > 0 then
+            targets[#targets + 1] = { volume_id = vid,
+                count = tonumber(entry.count) or 0 }
+        end
+    end
+    if #targets == 0 then return false, "no_volumes" end
+    local started_at = os.time()
+
+    local function settle(result)
+        if not result or not result.ok then
+            local reason = result and result.error or "unknown"
+            logger.err("comment sync (volumes): failed. reason=",
+                tostring(reason), "volumes=", tostring(#targets),
+                "elapsed=", tostring(os.time() - started_at), "s")
+            return 0
+        end
+        local value = result.value or {}
+        local groups = value.groups or {}
+        if #groups == 0 then return 0 end
+        local db = CommentStore.open(book_dir, store_namespace)
+        if not db then
+            logger.warn("comment sync (volumes): cannot open store")
+            return 0
+        end
+        local written = 0
+        for _i, group in ipairs(groups) do
+            local vid = tonumber(group.volume_id)
+            if vid and #(group.comments or {}) > 0 then
+                local stored = CommentStore.put_comments(db,
+                    Sync.NEW_COMMENT_KEY_BASE + vid, group.comments, {
+                        total = group.total,
+                        page = group.page or 1,
+                        complete = group.complete ~= false,
+                    })
+                if stored then written = written + #group.comments end
+            end
+        end
+        CommentStore.close(db)
+        logger.info("comment sync (volumes): done volumes=", tostring(#groups),
+            "comments=", tostring(written),
+            "elapsed=", tostring(os.time() - started_at), "s")
+        return written
+    end
+
+    local ok, err = self.worker:start{
+        queue = true,
+        protect = true,
+        timeout = options.timeout or 300,
+        on_progress = function(state)
+            if options.on_progress then pcall(options.on_progress, state) end
+        end,
+        on_done = function(result)
+            local written = settle(result)
+            if type(options.on_finished) == "function" then
+                pcall(options.on_finished, result, written)
+            end
+        end,
+        task = function(context)
+            local groups = {}
+            for index, target in ipairs(targets) do
+                context.checkCancelled()
+                local items, page, total, complete = {}, 1, target.count, false
+                while page <= 100 do
+                    context.emit{ stage = "comments", done = index,
+                        total = #targets, page = page, fetched = #items }
+                    local data = client:fetchBookComments(book_id,
+                        target.volume_id, page, { timeout = 40 })
+                    if not data then break end
+                    local list = data.list or {}
+                    local info = data.page_info or {}
+                    total = tonumber(info.count) or total
+                    for _j, raw in ipairs(list) do
+                        local normalized = CommentStore.normalize(
+                            map_new_comment(raw), #items + 1)
+                        if normalized then items[#items + 1] = normalized end
+                    end
+                    if (tonumber(info.has_next) or 0) == 0 or #list == 0 then
+                        complete = true
+                        break
+                    end
+                    page = page + 1
+                end
+                if #items > 0 then
+                    groups[#groups + 1] = { volume_id = target.volume_id,
+                        comments = items, total = total or #items,
+                        page = page, complete = complete }
+                end
+            end
+            return { groups = groups }
+        end,
+    }
+    if not ok then return false, err end
+    return true
+end
+
 return Sync
