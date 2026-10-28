@@ -43,9 +43,7 @@
 ### 步骤
 
 1. 把 `plugin/` 里的内容拷到 `koreader/plugins/lightnovel.koplugin/`
-2. （可选）把 `patches/2-zz-footer-progress-black.lua` 拷到 `koreader/patches/`，
-   修复底栏进度条在黑白波形下没有填充的问题
-3. 重启 KOReader
+2. 重启 KOReader
 
 目录结构：
 
@@ -58,8 +56,6 @@ koreader/
 │       └── lightnovel/
 │           ├── lib/
 │           └── ui/
-└── patches/
-    └── 2-zz-pageturn-fast.lua   （可选）
 ```
 
 ## 使用
@@ -86,17 +82,6 @@ koreader/
 - 目录页显示「评论：全部 N 卷已入库」或「已入库 x/N 卷」——评论缺没缺一目了然
 - 评论以附录形式嵌入 EPUB：旧书挂在章节末尾，新内容书挂在卷末
 
-## 翻页加速补丁（可选）
-
-`2-zz-pageturn-fast.lua` 放到 `koreader/patches/` 后：
-
-- 文字页 DU 极速（约 100ms）
-- 插图页自动灰阶（清晰、不整刷）
-- 菜单/按键温和刷新（无黑闪）
-- 每 N 页文字自动整刷一次（防残影，N 可调）
-
-设置 → 翻页优化 里可随时开关。
-
 ## 遇到问题
 
 菜单 → 导出诊断日志 → USB 连电脑 → `documents/lightnovel-诊断-*.txt` 发给开发者。
@@ -113,23 +98,6 @@ koreader/
 
 MIT
 
-
-## 在设备上截图（展示插件界面）
-
-两种方式，任选其一：
-
-1. **设备本地**：KOReader 菜单 → Tools → 更多工具 → 截图工具 → 「截取当前屏幕」，
-   PNG 落在 `koreader/screenshots/`，USB 取走即可。
-2. **电脑远程**：设备端 FileBrowser+ 与截图工具都在运行时，用仓库里的
-   [`tools/kindle_screenshot.py`](tools/kindle_screenshot.py) 一条命令取回 PNG：
-
-   ```bash
-   python tools/kindle_screenshot.py --ip <设备IP>            # 设备在同一局域网
-   python tools/kindle_screenshot.py --ip 127.0.0.1 --port 18080   # 经 SSH 隧道
-   ```
-
-   原理与协议见 `screenshottool.koplugin/SPEC-截图工具.md`；需要 USB 传书之外
-   的纯远程演示时用它。
 
 ## 免责声明
 
