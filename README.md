@@ -8,11 +8,14 @@
 
 **插件书架**——刷新书架、搜索、分类浏览、一键把已缓存书籍合并入库：
 
-![插件书架](docs/screenshot-bookshelf.png)
+**插件书架**（刷新 / 搜索 / 分类浏览 / 一键合并入库）　**下载完的成品**（出现在 KOReader 书库）：
 
-**下载完的成品**——导出的 EPUB 直接出现在 KOReader 书库里，打开即读：
+<p>
+  <img src="docs/screenshot-bookshelf.png" width="340" alt="插件书架">
+  <img src="docs/screenshot-library.png" width="340" alt="KOReader 书库">
+</p>
 
-![KOReader 书库](docs/screenshot-library.png)
+> 图为设备 framebuffer 原样输出；点击可看原图。
 
 ## 功能
 
