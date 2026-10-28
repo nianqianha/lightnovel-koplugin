@@ -22,8 +22,8 @@ import urllib.error
 import urllib.request
 
 
-def http(base, path, method="GET", token=None, body=None, timeout=60):
-    req = urllib.request.Request(base + path, data=body, method=method)
+def http(url, method="GET", token=None, body=None, timeout=60):
+    req = urllib.request.Request(url, data=body, method=method)
     if token:
         req.add_header("X-Auth", token)
     if body is not None:
@@ -60,7 +60,7 @@ def main():
     # request 与 ready 的内容格式是硬校验：首行必须等于 id / "ready"
     for name, payload in ((rid + ".request", (rid + "\n").encode()),
                           (rid + ".ready", b"ready\n")):
-        status, _ = http("/api/resources" + bridge + "/requests/" + name
+        status, _ = http(base + "/api/resources" + bridge + "/requests/" + name
                          + "?override=true", method="POST", token=token,
                          body=payload, timeout=60)
         if status != 200:
@@ -72,7 +72,7 @@ def main():
     while time.time() < deadline:
         time.sleep(1)
         try:
-            status, body = http("/api/raw" + result_path, token=token,
+            status, body = http(base + "/api/raw" + result_path, token=token,
                                 timeout=20)
         except urllib.error.HTTPError:
             continue
@@ -86,7 +86,7 @@ def main():
         raise SystemExit("设备未返回截图（等待 %ds）。result=%r"
                          % (args.wait, result_text[:120]))
 
-    _, png = http("/api/raw" + match.group(0), token=token, timeout=120)
+    _, png = http(base + "/api/raw" + match.group(0), token=token, timeout=120)
     if not png.startswith(b"\x89PNG"):
         raise SystemExit("下载的内容不是 PNG（%d 字节）" % len(png))
     with open(args.out, "wb") as f:
