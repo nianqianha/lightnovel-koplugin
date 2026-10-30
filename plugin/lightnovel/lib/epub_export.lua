@@ -309,7 +309,13 @@ rewrite_image_urls = function(body, client, assets, image_urls, on_progress,
     -- 被白名单挡下的数量单独记：这类失败重导多少次都不会好，只能改代码，
     -- 所以「库中书更新」不能把它当成需要重建的信号。
     local unsupported = 0
-    return (body:gsub('(<img[^>]-src%s*=%s*")([^"]+)(")',
+    -- 第三条捕获必须**含到标签结尾**（`" img-width=... style=... />`）。
+    --
+    -- 原模式只捕获到 src 的收尾引号，于是"图被拒/抓取失败"时 `return ""` 只删掉了
+    -- `<img src="URL"` 这一段，后面的属性残片（` style="max-width:100%;height:auto;" />`）
+    -- 留成了正文里的可见文字——2026-10-27 读者截图里那段 `style=...` 就是这个。
+    -- 改成一直吃到 `>`，成功路径换成新 URL、失败路径把整条标签删干净。
+    return (body:gsub('(<img[^>]-src%s*=%s*")([^"]+)("[^>]*>)',
         function(prefix, source, suffix)
             local url = Content.decode_entities(source):gsub("%)$", "")
             local parsed = url:match("^https?://([^/]+)")

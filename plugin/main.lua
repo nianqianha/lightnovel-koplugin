@@ -195,7 +195,7 @@ self:registerMenu()
 -- deploy does NOT take effect until the app is restarted; without this line
 -- there is no way to tell which build the device is actually running, and a
 -- stale build looks exactly like a new bug.
-logger.info("BUILD b54-task-gap-diag (任务进度入口常驻; 点开无任务时记日志, 定位两阶段之间的空档; 含 b19-b53)",
+logger.info("BUILD b55-img-tag-fix (修抓图失败时 <img> 属性残片漏进正文; 含 b19-b54)",
     "at", tostring(os.date("%Y-%m-%d %H:%M:%S")))
 logger.info("initialized version=", self.version)
 end
