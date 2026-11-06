@@ -106,10 +106,28 @@ function LightNovelPlugin:requestDiagnosticScreenshot(tag, delay)
     return scheduled and true or false
 end
 
+--- 把设置里的字形选项推给渲染侧（Content）与缓存标记侧（Cache）（b59）。
+---
+--- 只认三个值：raw 原文 / simp 简体 / trad 繁体。设置文件被手改成别的值时退回
+--- raw——宁可不动字形，也不要在正文里乱替换。
+function LightNovelPlugin:applyVariantMode()
+    local mode = self.settings:get("text.variant", "raw")
+    if mode ~= "simp" and mode ~= "trad" then
+        mode = "raw"
+    end
+    Content.variant_mode = mode
+    Cache.variant_mode = mode
+    return mode
+end
+
 function LightNovelPlugin:init()
     math.randomseed(os.time())
     self.settings = Settings:new()
     self.client = Client:new(self.settings)
+    -- 字形设置（b59）：正文按"原文 / 简体 / 繁体"生成。两个模块各存一份
+    -- （渲染侧 Content、缓存标记侧 Cache），必须在建 cache 之前就位——init 里
+    -- 随后就可能判断章节是否已缓存。
+    self:applyVariantMode()
     self.cache = Cache:new(self.settings)
     -- worker 必须跨插件实例共享（b41）。
     --
@@ -195,7 +213,7 @@ self:registerMenu()
 -- deploy does NOT take effect until the app is restarted; without this line
 -- there is no way to tell which build the device is actually running, and a
 -- stale build looks exactly like a new bug.
-logger.info("BUILD b55-img-tag-fix (修抓图失败时 <img> 属性残片漏进正文; 含 b19-b54)",
+logger.info("BUILD b60-trad-page (繁体: 小章节取站点 /tw 页, 大章节直接本地表; 含 b19-b59)",
     "at", tostring(os.date("%Y-%m-%d %H:%M:%S")))
 logger.info("initialized version=", self.version)
 end
@@ -959,6 +977,10 @@ function LightNovelPlugin:cacheWholeBook(options)
     end
     local new_content_book = (tonumber(self.current_book and self.current_book.book_id) or 0) > 0
 
+    -- 字形来源统计按"每次整本下载"清零（b60）：导出完成时要能说清这一批繁体正文
+    -- 是站点的繁体页给的，还是本地转换表兜的。
+    Content.reset_variant_stats()
+
     -- 下载期间把插件书架铺在弹窗下面。
     --
     -- 目录页的"下载入库"会先关闭目录，于是弹窗下面直接露出文件管理器/插件菜单，
@@ -1406,6 +1428,35 @@ function LightNovelPlugin:cacheWholeBook(options)
     self:reportTaskProgress{ stage = "catalog", page = 1 }
 end
 
+--- 导出成功后让文件管理器重扫目录（b58）。
+---
+--- 现象（2026-11-01 读者反馈）：导出弹窗明明说"已导出"，回到 KOReader 的列表里
+--- 却找不到这本书，必须退出 KOReader 再进一次才出现。
+---
+--- 不是写错路径，也不是权限——文件确实在盘上。是 FileChooser 把目录内容缓存在
+--- 内存里，只在自己刷新或切目录时才重读磁盘；我们是在它背后直接往 documents 写的，
+--- 没有任何人通知它，于是列表停在导出前的状态。
+---
+--- KOReader 自己的复制/粘贴/删除/重命名都是靠这条事件收尾的
+--- （filemanager.lua: `FileManager.onRefreshContent = FileManager.onRefresh`），
+--- 跟着走同一条路，就不用去依赖内部模块路径。
+local function refresh_file_browser(reason)
+    local ok, err = pcall(function()
+        UIManager:broadcastEvent(Event:new("RefreshContent"))
+    end)
+    if not ok then
+        -- 没有 broadcastEvent 的旧版本才走这里（内部 API，纯兜底）。
+        pcall(function()
+            local fm = require("apps/filemanager/filemanager")
+            if fm and fm.instance and fm.instance.onRefresh then
+                fm.instance:onRefresh()
+            end
+        end)
+    end
+    logger.dbg("refresh file browser: ", tostring(reason),
+        "via=", ok and "event" or "fallback", err and tostring(err) or "")
+end
+
 --- Package the cached book into one EPUB with its comments (option A: the
 --- comments of a chapter are printed at the end of that chapter).
 ---
@@ -1565,6 +1616,10 @@ function LightNovelPlugin:exportBook(options)
         end
         logger.info("exportBook done:", path, "chapters=", tostring(chapters),
             "comment_chapters=", tostring(comment_chapters))
+        -- b58：书已经在盘上了，但文件管理器的列表是内存缓存，必须显式通知它重扫，
+        -- 否则读者要退出 KOReader 再进一次才看得到（2026-11-01 反馈）。
+        -- 静默重出（库中书更新自动修复）同样要刷，那条路也会写新文件。
+        refresh_file_browser("export done")
         if not options.silent then
             -- b37：把插图成败写进完成弹窗。读者在书里已经看不到占位符，
             -- 缺了几张必须在这里说清楚，否则"没有任何提示"等于"全都好了"。
@@ -1584,9 +1639,27 @@ function LightNovelPlugin:exportBook(options)
                         images_ok, st.total)
                 end
             end
+            -- 字形来源（b60）：繁体正文优先取站点的繁体页，取不到才用本地表。
+            -- 这里必须说清楚，否则读者无法判断看到的是站点原文还是本地转换结果。
+            local variant_note = ""
+            if Content.variant_mode == "trad" or Content.variant_mode == "simp" then
+                local stats = Content.variant_stats or {}
+                local server = tonumber(stats.server) or 0
+                local local_table = tonumber(stats.local_table) or 0
+                if Content.variant_mode == "simp" then
+                    if local_table > 0 then
+                        variant_note = string.format(
+                            _("\n字形：简体（本地转换表 %d 章）"), local_table)
+                    end
+                elseif server + local_table > 0 then
+                    variant_note = string.format(
+                        _("\n字形：繁体（站点繁体页 %d 章 / 本地转换表 %d 章）"),
+                        server, local_table)
+                end
+            end
             UIManager:show(InfoMessage:new{
-                text = string.format(_("已导出 %d 章（含 %d 章评论）%s\n%s"),
-                    chapters, comment_chapters, images, path),
+                text = string.format(_("已导出 %d 章（含 %d 章评论）%s%s\n%s"),
+                    chapters, comment_chapters, images, variant_note, path),
             })
         end
         reopen_catalogue()

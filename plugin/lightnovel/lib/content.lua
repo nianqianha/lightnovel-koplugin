@@ -13,8 +13,26 @@ popup without any JavaScript.
 --]]--
 
 local logger = require("lightnovel.lib.logger")
+local Variant = require("lightnovel.lib.variant")
 
 local Content = {}
+
+--- 下载/重出时要转成哪种字形："raw"（原文，默认）/ "simp"（简体）/ "trad"（繁体）。
+---
+--- 由 main 在插件 init 时按设置写入，设置项切换后立即改这个字段。放在模块上而不是
+--- 逐层传参：渲染入口有 text_to_html / paragraphs_to_html / chapter_body_html 三条，
+--- 传参会把签名改得到处都是，而这是个全局语义。
+Content.variant_mode = "raw"
+
+--- 按当前设置转换字形。mode 为 raw 时**原样返回同一个字符串**（零开销）。
+local function to_variant(text)
+    local mode = Content.variant_mode
+    if not mode or mode == "raw" then
+        return text
+    end
+    return Variant.convert(text, mode)
+end
+Content.to_variant = to_variant
 
 local write_seq = 0
 
@@ -174,6 +192,11 @@ function Content.strip_bbcode(text)
         if BBCODE_DROP[n] then return "" end
         return nil -- 未知标记原样保留
     end)
+    -- Markdown 链接的处理放在下面（它要用到 is_image_url，必须定义在后者之后），
+    -- 所以这里通过模块表间接调用，避免 Lua 的前向引用被静默当成 nil 全局。
+    if Content.strip_markdown_links then
+        out = Content.strip_markdown_links(out)
+    end
     return out
 end
 
@@ -184,6 +207,11 @@ function Content.comment_plain_text(value)
     text = text:gsub("<img[^>]*>", " [图片/表情] ")
     text = text:gsub("%[img[^%]]*%].-%[/img%]", " [图片/表情] ")
     text = text:gsub("<[A-Za-z/][^>]*>", "")
+    -- 评论里也会出现 Markdown 链接。必须放在下面这条"删 [xxx] 标记"之前，
+    -- 否则方括号先被吃掉，只剩一截赤裸的 "(https://…)"。
+    if Content.strip_markdown_links then
+        text = Content.strip_markdown_links(text)
+    end
     text = text:gsub("%[/?[a-zA-Z][^%]]*%]", "")
     return text
 end
@@ -230,12 +258,225 @@ local function is_image_url(url)
 end
 Content.is_image_url = is_image_url
 
+--- 站点正文里另有一类脏东西：**Markdown 链接**，而且常是**缺收尾括号**的残形。
+---
+--- 2026-10-31 实测（book 31165《游戏人生》第 3 卷 chapter 313886）服务端下发的
+--- HTML 原文：
+---   <p>[\_三校\_]NO GAME NO LIFE游戏人生3\_简繁\_.rar](https://api.lightnovel.fun/
+---   …/214350gfjmvvccdx4c09u4.rar?m=…&t=…</p>
+--- 注意 ")" **不存在**。站点自己的渲染器也因此没把它识别成链接，原样当正文下发；
+--- 读者在 Kindle 上看到的就是一长条 URL 铺在页面上（2026-10-31 截图）。
+---
+--- 规则：
+---   * `[文字](地址)` → 只留"文字"（地址在 Kindle 上既不可点也不可达）；
+---   * 地址是压缩包/文档附件 → **整条删掉**：剩下的只有文件名，读者打不开，
+---     而且紧挨着就是书名行，留着纯噪音；
+---   * `![说明](图片地址)` 且确实是图片 → 还原成裸 URL，交给既有的图片识别；
+---   * `\[` `\]` 这类 Markdown 转义还原成 `[` `]`；
+---   * 收尾的 ")" 允许缺失（站点数据里本来就是缺的），地址在空白/换行/`<` 处截断，
+---     绝不会把后面的 `</p>` 一起吃掉。
+local MD_ATTACHMENT_EXT = {
+    rar = true, zip = true, ["7z"] = true, tar = true, gz = true, bz2 = true,
+    txt = true, doc = true, docx = true, pdf = true, epub = true,
+    mobi = true, azw3 = true, torrent = true,
+}
+
+local function is_attachment_url(url)
+    local path = url:gsub("[%?#].*$", "")
+    local ext = path:match("%.([%w]+)$")
+    return ext ~= nil and MD_ATTACHMENT_EXT[ext:lower()] == true
+end
+
+local function md_unescape(label)
+    return (label:gsub("\\([%[%]%(%)%*_`#!~%-])", "%1"))
+end
+
+local function strip_markdown_links(text)
+    local s = tostring(text or "")
+    -- 绝大多数段落连一个 "](" 都没有，先便宜地短路掉。
+    if not s:find("]%(", 1) and not s:find("!%[", 1) then
+        return s
+    end
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        local is_image = c == "!" and s:sub(i + 1, i + 1) == "["
+        local open = is_image and (i + 1) or i
+        if s:sub(open, open) == "[" then
+            -- 找配对的 "]"：跳过 \[ \] 转义，不跨行。
+            local j, close = open + 1, nil
+            while j <= n do
+                local d = s:sub(j, j)
+                if d == "\\" then
+                    j = j + 2
+                elseif d == "\n" then
+                    break
+                elseif d == "]" then
+                    close = j
+                    break
+                else
+                    j = j + 1
+                end
+            end
+            if close and s:sub(close + 1, close + 1) == "(" then
+                -- 地址可能缺收尾 ")"，在空白/换行/引号/尖括号处截断。
+                local k = close + 2
+                while k <= n do
+                    local d = s:sub(k, k)
+                    if d == ")" or d == "\n" or d == "<" or d == ">"
+                        or d == '"' or d == "'" or d == " " or d == "\t" then
+                        break
+                    end
+                    k = k + 1
+                end
+                local url = s:sub(close + 2, k - 1)
+                if url:match("^https?://") or url:match("^//") then
+                    local emit
+                    if is_attachment_url(url) then
+                        emit = ""
+                    elseif is_image then
+                        emit = is_image_url(url) and (" " .. url .. " ") or ""
+                    else
+                        emit = md_unescape(s:sub(open + 1, close - 1))
+                    end
+                    out[#out + 1] = emit
+                    i = (s:sub(k, k) == ")") and (k + 1) or k
+                else
+                    out[#out + 1] = c
+                    i = i + 1
+                end
+            else
+                out[#out + 1] = c
+                i = i + 1
+            end
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+Content.strip_markdown_links = strip_markdown_links
+
+--- 清理之后仍然"看起来像标记"的签名。
+---
+--- 为什么要有这个：2026-10-26、10-29、10-31 读者连着拍了三次屏——BBCode、
+--- `<img>` 半截标签、Markdown 链接。每次都是在 `strip_bbcode` 里再补一条黑名单，
+--- 黑名单天然会漏下一种写法，于是同一个位置反复出问题。
+---
+--- 这里做的是**反向检查**：清洗完的正文里只要还看得见这些签名，就说明又漏了，
+--- 直接写日志报警（带章节号与样例），不必等读者把屏幕拍下来。
+---
+--- 只扫标签之外的文字。判定必须严格，否则日志会被误报淹掉——
+--- 2026-10-31 全量跑 82 章时，最初的"方括号里是字母就算 BBCode"把《密室》[IV]、[VI]
+--- 这类卷标全报了；所以这里只认 BBCODE_DROP/BBCODE_BREAK 里的真标签名。
+local HTML_TAG_NAMES = {
+    img = true, br = true, p = true, div = true, span = true, em = true,
+    strong = true, a = true, ruby = true, rt = true, table = true, tr = true,
+    td = true, b = true, i = true, u = true,
+}
+
+local RESIDUE_SIGNATURES = {
+    { kind = "md-link", pattern = "%]%s*%(" },
+    { kind = "md-escape", pattern = "\\[%[%]]" },
+    { kind = "res-token", pattern = "%[res%]" },
+    { kind = "img-attr", pattern = "img%-width%s*=" },
+    -- b55 那次事故：图片抓取失败时只删掉 `<img src="…"`，剩下的
+    -- `style="max-width:100%;height:auto;" />` 被当正文渲染。属性片段本身
+    -- 没有 `img-` 前缀，所以单独认「标识符="…"」这种只在标签里才成立的写法。
+    { kind = "attr-fragment", pattern = "[%a][%w%-]*%s*=%s*\"" },
+    { kind = "upload-url", pattern = "upload%-files" },
+}
+
+--- 只在文字里出现「真标签名」的方括号标记才算 BBCode 残留。
+local function scan_bbcode(text)
+    local n, sample = 0, nil
+    for name in text:gmatch("%[/?([A-Za-z][%w_]*)%s*[=%]]") do
+        local lower = name:lower()
+        if BBCODE_DROP[lower] or BBCODE_BREAK[lower] then
+            n = n + 1
+            sample = sample or ("[" .. name .. "]")
+            if n >= 500 then break end
+        end
+    end
+    return n, sample
+end
+
+--- 正文里出现 `&lt;img …&gt;` 这种"整条标签被当文字显示"的情况才算残留。
+--- 必须带收尾的 `&gt;`：译名/算式里的 `a&lt;b` 是正常的 `<`，报出来就是噪音。
+local function scan_escaped_tag(text)
+    local n, sample = 0, nil
+    for name in text:gmatch("&lt;%s*/?%s*([A-Za-z][%w]*)[^&<]-&gt;") do
+        if HTML_TAG_NAMES[name:lower()] then
+            n = n + 1
+            sample = sample or ("<" .. name .. ">")
+            if n >= 500 then break end
+        end
+    end
+    return n, sample
+end
+
+--- 去掉站点混进"纯文本"里的 HTML 包装标签。
+---
+--- 只认 HTML_TAG_NAMES 里的名字，正文里 `a<b` 之类的算式不会被误删。
+--- `<img src>` 换成裸 URL 再交给 text_to_html 走既有插图识别——直接删掉会丢图。
+--- 块级标签留一个换行，避免两段黏成一段。
+local WRAPPER_BLOCK = { br = true, p = true, hr = true, div = true }
+
+function Content.strip_wrapper_tags(text)
+    local out = tostring(text or "")
+    out = out:gsub("<%s*[Bb][Rr]%s*/?%s*>", "\n")
+    out = out:gsub("(<%s*[Ii][Mm][Gg]%s[^>]*>)", function(tag)
+        local src = tag:match('[Ss][Rr][Cc]%s*=%s*"([^"]+)"')
+            or tag:match("[Ss][Rr][Cc]%s*=%s*'([^']+)'")
+        if src then return " " .. src .. " " end
+        return ""
+    end)
+    out = out:gsub("<%s*/?%s*([A-Za-z][%w]*)[^>]*>", function(name)
+        local lower = name:lower()
+        if WRAPPER_BLOCK[lower] then return "\n" end
+        if HTML_TAG_NAMES[lower] then return "" end
+        return nil -- 不认识的不动，交给 scan_residue 报警
+    end)
+    return out
+end
+
+--- 统计渲染结果里残留的标记签名。
+--- @treturn table { total = <次数>, hits = { {kind=…, count=…, sample=…}, … } }
+function Content.scan_residue(html)
+    local text = tostring(html or "")
+    text = text:gsub("<[^>]->", " ")
+    local hits, total = {}, 0
+    local function add(kind, n, sample)
+        if n and n > 0 then
+            total = total + n
+            hits[#hits + 1] = { kind = kind, count = n, sample = sample }
+        end
+    end
+    for _, sig in ipairs(RESIDUE_SIGNATURES) do
+        local n, sample = 0, nil
+        for found in text:gmatch(sig.pattern) do
+            n = n + 1
+            sample = sample or found
+            if n >= 500 then break end
+        end
+        add(sig.kind, n, sample)
+    end
+    add("bbcode", scan_bbcode(text))
+    add("html-tag-as-text", scan_escaped_tag(text))
+    return { total = total, hits = hits }
+end
+
 --- Sentinel used to carry a URL out of a gsub without re-escaping it.
 local IMG_MARK = "\1img\1"
 
 --- Convert plain text into paragraph HTML, turning bare image URLs into <img>.
 function Content.text_to_html(text)
-    local body = strip_leading_toc(Content.strip_bbcode(Content.decode_entities(text or "")))
+    -- 先解码实体再转字形：转换表里全是汉字，实体是 ASCII，先后无所谓，
+    -- 但必须在 xml_escape 之前，否则实体化后的字符表对不上。
+    local body = strip_leading_toc(Content.strip_bbcode(
+        Content.decode_entities(to_variant(text or ""))))
     body = body:gsub("\r\n", "\n"):gsub("\r", "\n")
 
     local out = {}
@@ -298,7 +539,7 @@ function Content.paragraphs_to_html(paragraphs, resources)
         if type(text) ~= "string" then
             text = tostring(text or "")
         end
-        text = Content.strip_bbcode(Content.decode_entities(text))
+        text = Content.strip_bbcode(Content.decode_entities(to_variant(text)))
         text = text:gsub("%[res%]ext:([%w_%-]+)%[/res%]", function(key)
             local item = resources[key]
             local url = type(item) == "table"
@@ -416,6 +657,22 @@ function Content.body_text_html(body_text, detail)
         logger.warn("content: unresolved body resource", key)
         return "[插图暂不可用]"
     end)
+    -- `body_text` 名义上是纯文本，实测会夹着站点的包装标签：book 5143 的
+    -- 第 5&6 卷有 252 处 `<span style="color:#424242">…</span>`。这些标签
+    -- 一路走到 xml_escape 就变成正文里可见的 `<span style="color:#424242">`，
+    -- 和 BBCode / `<img>` 残片是同一类事故，所以在进 XML 之前先摘掉。
+    text = Content.strip_wrapper_tags(text)
+    -- 剩下解不出的 `[res]…[/res]` 是站点自己的占位符（实测形如 `[res]0,257517[/res]`，
+    -- 该章 `legacy_resources.res_info` 为空，没有 URL 可还原）。留着就会原样显示，
+    -- 按"未知标记不得上屏"一并清掉；少一张图好过正文里多一行乱码。
+    local dropped = 0
+    text = text:gsub("%[res%].-%[/res%]", function()
+        dropped = dropped + 1
+        return ""
+    end)
+    if dropped > 0 then
+        logger.dbg("content: dropped unresolved res tokens ", dropped)
+    end
     return Content.text_to_html(text)
 end
 
@@ -429,7 +686,7 @@ function Content.chapter_body_html(detail, paragraphs)
         if type(html) == "string" and html:match("<%s*[PpHhIi]") then
             -- 服务端渲染的 HTML 里也见过 BBCode 混排，同一套去皮先跑一遍；
             -- 输出进的是 XML，不能把标记留给 crengine 当正文。
-            html = Content.strip_bbcode(html)
+            html = Content.strip_bbcode(to_variant(html))
             local resources = Content.resource_map(detail)
             return (html:gsub("%[res%]ext:([%w_%-]+)%[/res%]", function(key)
                 local item = resources[key]
@@ -449,6 +706,101 @@ function Content.chapter_body_html(detail, paragraphs)
     end
     local resources = Content.resource_map(detail)
     return Content.paragraphs_to_html(paragraphs, resources)
+end
+
+--- 从站点的阅读页 HTML 里取出正文段落（b60）。
+---
+--- 页面结构：`<section class="…reader-body">` → `<div class="reader-text">`，里面全是 `<p>`。
+--- 不能直接搜 `"<p"`：SVG 图标里有 `<path>`，`<p[^>]*>` 会把整个图标吞掉。必须看
+--- `<p` 后面紧跟的是空格还是 `>`，再按 `</p>` 收尾。
+---
+--- 返回 nil 的三种情况都会让调用方退回本地转换表：
+---   no_reader_text —— 页面结构变了（站点改版）
+---   truncated      —— `reader-text` 这块没有闭合，多半是长章节传到一半断了
+---   no_paragraphs  —— 结构对但没有段落
+---
+--- @treturn string|nil 段落 HTML（`<p>…</p>` 换行连接）
+--- @treturn string|nil 失败原因
+function Content.reader_page_html(html)
+    local s = tostring(html or "")
+    -- 不要求 class 恰好以引号收尾：站点可能给它再加状态类
+    -- （同一页的 section 就出现过 class="…reader-body"），只认前缀更稳。
+    local open = s:find('<div class="reader-text', 1, true)
+    if not open then
+        return nil, "no_reader_text"
+    end
+    -- 配平 div：确认这一块收口了。长章节在慢网络上经常读到一半就断。
+    local i, depth, close = open, 0, nil
+    while true do
+        local o = s:find("<div", i, true)
+        local c = s:find("</div>", i, true)
+        if not c then
+            break
+        end
+        if o and o < c then
+            depth = depth + 1
+            i = o + 4
+        else
+            depth = depth - 1
+            i = c + 6
+            if depth == 0 then
+                close = i - 1
+                break
+            end
+        end
+    end
+    if not close then
+        return nil, "truncated"
+    end
+
+    local seg = s:sub(open, close)
+    local out, pos = {}, 1
+    while true do
+        local p = seg:find("<p", pos, true)
+        if not p then
+            break
+        end
+        local after = seg:sub(p + 2, p + 2)
+        if after == ">" or after == " " or after == "\n"
+            or after == "\t" or after == "\r" then
+            local gt = seg:find(">", p + 2, true)
+            local cl = gt and seg:find("</p>", gt + 1, true)
+            if gt and cl then
+                local inner = seg:sub(gt + 1, cl - 1)
+                -- 站点给每个节点挂着 data-v-xxxx 作用域属性，进 EPUB 没有意义
+                inner = inner:gsub('%s+data%-v%-[%w]+%s*=%s*"[^"]*"', "")
+                inner = inner:gsub("^%s+", ""):gsub("%s+$", "")
+                if inner ~= "" then
+                    out[#out + 1] = "<p>" .. inner .. "</p>"
+                end
+                pos = cl + 4
+            else
+                pos = p + 2
+            end
+        else
+            pos = p + 2
+        end
+    end
+    if #out == 0 then
+        return nil, "no_paragraphs"
+    end
+    return table.concat(out, "\n")
+end
+
+--- 记录这一章的字形是从哪来的，好在日志与完成弹窗里说清楚（b60）。
+Content.variant_stats = { server = 0, local_table = 0 }
+
+function Content.note_variant_source(kind)
+    local stats = Content.variant_stats
+    if kind == "server" then
+        stats.server = stats.server + 1
+    elseif kind == "local" then
+        stats.local_table = stats.local_table + 1
+    end
+end
+
+function Content.reset_variant_stats()
+    Content.variant_stats = { server = 0, local_table = 0 }
 end
 
 -- NOTE: crengine ignores CSS `pointer-events` for link hit-testing, so the
@@ -485,6 +837,20 @@ end
 -- @number aid article id, used to build the comment link target
 function Content.build_chapter_xhtml(title, body_html, comment_count, aid)
     aid = tonumber(aid) or 0
+    -- 标题也按同一字形走，否则设成繁体后正文是繁体、章名还是原文。
+    if type(title) == "string" then
+        title = to_variant(title)
+    end
+    -- 所有章节 XHTML 都从这里出去（单章、批量、下载、重出四条路径），
+    -- 残留检查放这里才能保证"一次覆盖全部出口"。
+    local scan = Content.scan_residue(body_html)
+    if scan.total > 0 then
+        for _, hit in ipairs(scan.hits) do
+            logger.warn("content residue: kind=", hit.kind,
+                "count=", hit.count, "chapter=", tostring(aid),
+                "sample=", tostring(hit.sample):sub(1, 60))
+        end
+    end
     local marker = ""
     if tonumber(comment_count) and comment_count > 0 and aid > 0 then
         -- href points at a real in-document anchor so crengine keeps the link

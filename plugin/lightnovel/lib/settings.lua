@@ -30,6 +30,9 @@ function Settings:new()
             -- library folder; see libraryDir() for why this is not the plugin
             -- data directory.
             library = { dir = "" },
+            -- 字形：raw 原文 / simp 简体 / trad 繁体（b59）。站点自己也有简繁切换，
+            -- 因为有的卷是繁体原文、有的是简体录入；这里默认不动，选了才转。
+            text = { variant = "raw" },
         },
     }, self)
 

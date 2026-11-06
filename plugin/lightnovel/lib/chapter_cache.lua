@@ -26,6 +26,86 @@ local Content = require("lightnovel.lib.content")
 local Cover = require("lightnovel.lib.cover")
 local logger = require("lightnovel.lib.logger")
 
+--- 生成一章正文。字形设成"繁体"时先走站点自己的繁体页（b60）。
+---
+--- 站点确实有官方繁体：阅读页里写着
+---   <link rel="alternate" hreflang="zh-Hant" href="…/tw/reader/<book>/<chapter>">
+--- 但 JSON 接口没有字形参数（charset/lang/simple/traditional/variant/convert
+--- 全试过，返回内容一字不差），所以只能取网页。实测短章节的繁体页与接口正文
+--- 逐段对应（273 段对 273 段），差别只在字形。
+---
+--- 站点慢的时候长章节页面会传一半就断，`reader_page_html` 会返回 "truncated"；
+--- 页面正文明显短于接口正文也按不可用处理。这两种情况都退回本地 OpenCC 表，
+--- 并把这一章实际用的是哪条路记下来（日志 + 导出完成提示里会报数量）。
+---
+--- @param client Client 实例
+--- @param book_id 站点书号（legacy 书没有，传 nil 就直接走本地表）
+--- @param chapter_id 章节号
+--- @param detail 接口返回的章节详情
+--- @param paragraphs 段落数组（可为 nil）
+--- 超过这个接口正文大小就不去要站点繁体页（b60）。
+---
+--- 换算依据（2026-11-06 实测）：接口 body_html ≈ 2 字节/字；站点页面 ≈ 38 字节/字，
+--- 即页面大小约等于 body_html 的 18 倍。站点给这类大页面的速率只有 1–18 KB/s，
+--- 32 KB 的 body_html 对应约 570 KB 页面、30 秒左右，正好落在 60 秒超时以内。
+--- 再大就会白等到超时，还不如直接本地转换——所以这里按大小预先分流。
+local PAGE_FETCH_LIMIT = 32 * 1024
+
+local function build_chapter_body(client, book_id, chapter_id, detail, paragraphs)
+    if Content.variant_mode == "trad" and client
+        and tonumber(book_id) and tonumber(chapter_id) then
+        local snapshot = type(detail) == "table" and detail.body_snapshot or nil
+        local expect = (type(snapshot) == "table"
+            and #tostring(snapshot.body_html or "")) or 0
+        -- 站点页面约 38 字节/字，而它给大页面的速率会掉到 1 KB/s 上下
+        -- （2026-11-06 实测：6308 字的章 243 KB / 13 s；11 万字的章两次都只
+        -- 到 180 KB 就断）。超过这个量就不去要页面了，否则每章白等 60 秒超时。
+        if expect > PAGE_FETCH_LIMIT then
+            logger.dbg("variant: page skipped (larger than limit) chapter=",
+                tostring(chapter_id), "expect~", expect)
+        else
+            local page, err = client:fetchTraditionalPage(book_id, chapter_id,
+                { timeout = 60 })
+            if page then
+                local body, perr = Content.reader_page_html(page)
+                if not body and perr == "truncated" then
+                    -- 截断多半是瞬时现象，再试一次；还不行才退回本地表。
+                    logger.warn("variant: /tw page truncated, retrying chapter=",
+                        tostring(chapter_id))
+                    page, err = client:fetchTraditionalPage(book_id, chapter_id,
+                        { timeout = 60 })
+                    if page then
+                        body, perr = Content.reader_page_html(page)
+                    end
+                end
+                if body then
+                    -- expect 为 0 表示没有可比对的接口正文（例如只拿到段落数组），
+                    -- 这时信任页面本身；有正文时要求页面不低于它的六成。
+                    if expect == 0 or #body >= expect * 0.6 then
+                        Content.note_variant_source("server")
+                        logger.dbg("variant: server page chapter=",
+                            tostring(chapter_id), "bytes=", #body, "expect~", expect)
+                        return body
+                    end
+                    logger.warn("variant: /tw page too short, fallback to table chapter=",
+                        tostring(chapter_id), "got=", #body, "expect~", expect)
+                else
+                    logger.warn("variant: /tw page unusable chapter=",
+                        tostring(chapter_id), "reason=", tostring(perr))
+                end
+            else
+                logger.warn("variant: /tw page fetch failed chapter=",
+                    tostring(chapter_id), "err=", tostring(err))
+            end
+        end
+        Content.note_variant_source("local")
+    elseif Content.variant_mode == "simp" then
+        -- 简体只有本地表一条路，也记一笔，导出时才说得清用了什么
+        Content.note_variant_source("local")
+    end
+    return Content.chapter_body_html(detail, paragraphs)
+end
+
 -- How hard to try a chapter whose body did not arrive. On 2026-10-10 a download of
 -- 《义妹生活》 died on chapter 218070 with `sink timeout` -- LuaSocket's read
 -- timeout, i.e. the socket went quiet for the whole 60s window -- and the old code
@@ -226,7 +306,16 @@ end
 -- is_cached 只看文件在不在，于是"下载入库"认为都齐了、一个都不重下，读者
 -- 屏幕上还是旧的 `[justify]`。加一个 per-book 标记文件，版本不符就按未缓存
 -- 处理，下次下载自动重取。改抽取逻辑时记得把这个数字加一。
-local CHAPTER_HTML_VERSION = 2
+--
+-- b56：3 —— 正文还会夹 Markdown 链接（`[文字](地址)`，而且站点数据常常缺收尾
+-- 括号），《游戏人生》第 3 卷那一整条 .rar 下载地址就是这么铺在页面上的。
+local CHAPTER_HTML_VERSION = 3
+
+--- 当前字形设置（"raw" / "simp" / "trad"），main 在 init 和菜单切换时写入。
+---
+--- b59：标记文件第二行记它。同一章在三种字形下生成的 XHTML 内容不同，只比版本号
+--- 会让改了设置的人继续读旧字形的缓存。
+Cache.variant_mode = "raw"
 
 function Cache:_format_marker(key)
     return self:_book_dir(key) .. "/chapters/.format"
@@ -243,9 +332,15 @@ function Cache:format_ok(key)
     local f = io.open(self:_format_marker(key), "r")
     local ok = false
     if f then
-        local version = tonumber(f:read("*n"))
+        local body = f:read("*a") or ""
         f:close()
-        ok = version == CHAPTER_HTML_VERSION
+        local version, variant = body:match("^(%d+)%s*([^%s]*)")
+        -- 旧标记只有一行版本号，那时没有字形概念，等价于"原文"
+        if variant == nil or variant == "" then
+            variant = "raw"
+        end
+        ok = tonumber(version) == CHAPTER_HTML_VERSION
+            and variant == (Cache.variant_mode or "raw")
     end
     if ok then self._format_cache[key] = true end
     return ok
@@ -257,7 +352,9 @@ function Cache:mark_format(key)
     local tmp = path .. ".tmp"
     local f = io.open(tmp, "w")
     if f then
+        -- 第一行版本、第二行字形；format_ok 两个都要对上
         f:write(tostring(CHAPTER_HTML_VERSION) .. "\n")
+        f:write(tostring(Cache.variant_mode or "raw") .. "\n")
         f:close()
         os.remove(path)
         os.rename(tmp, path)
@@ -454,7 +551,7 @@ function Cache:fetch_shelf_chapter(client, key, chapter, comment_count)
         logger.warn("chapter: detail html unavailable chapter=",
             tostring(chapter_id), "err=", tostring(detail_err))
     end
-    local body = Content.chapter_body_html(details, paragraphs)
+    local body = build_chapter_body(client, book_id, chapter_id, details, paragraphs)
     if body:gsub("%s", "") == "" then
         return nil, "empty_content"
     end
@@ -997,7 +1094,7 @@ function Cache:download_web_catalog_book(client, book, context)
             local cid = tonumber(row and row.chapter_id)
             if cid and batch_requested[cid] and batched[cid] == nil then
                 local snapshot = row.body_snapshot or {}
-                local body = Content.chapter_body_html(
+                local body = build_chapter_body(client, book_id, cid,
                     { body_snapshot = snapshot,
                       legacy_resources = row.legacy_resources }, nil)
                 if body and body:gsub("%s", "") ~= "" then
@@ -1032,7 +1129,7 @@ function Cache:download_web_catalog_book(client, book, context)
             local detail, detail_err = client:fetchWebChapterDetail(book_id, id,
                 { timeout = 60 })
             if detail then
-                local body = Content.chapter_body_html(detail, nil)
+                local body = build_chapter_body(client, book_id, id, detail, nil)
                 if body:gsub("%s", "") ~= "" then
                     return body, nil, attempt
                 end
@@ -1291,7 +1388,7 @@ function Cache:download_whole_book(client, book, context)
                         "chapter=", tostring(cid), "err=", tostring(detail_err))
                 end
             end
-            local body = Content.chapter_body_html(detail, nil)
+            local body = build_chapter_body(client, book_id, cid, detail, nil)
             if body:gsub("%s", "") == "" then
                 body = Content.text_to_html(snapshot.body_text or "")
             end

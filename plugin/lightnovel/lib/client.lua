@@ -91,6 +91,10 @@ local BASE_URL = "https://api.lightnovel.fun"
 -- legacy envelope. Going through the /api/pc-proxy prefix returns code 0.
 local BFF_BASE_URL = "https://www.lightnovel.fun/api/pc-proxy"
 
+-- 网页正文（含繁体版）只在网站这一侧提供，走 /reader/<book>/<chapter>。
+-- 见 Client:fetchTraditionalPage 的注释：JSON 接口没有任何字形参数。
+local READER_BASE_URL = "https://www.lightnovel.fun"
+
 -- The Android app identifies itself with a Dart UA. The site also serves a
 -- desktop UI to unknown agents, so we keep the app UA to stay on the API shape.
 local APP_UA = "Dart/3.8 (dart:io)"
@@ -632,6 +636,28 @@ function Client:fetchWebVolumeChapters(book_id, volume_id, page, options)
             ["Referer"] = "https://www.lightnovel.fun/",
         },
     })
+end
+
+--- 取站点的**繁体**正文页面（b60）。
+---
+--- 站点自己就有简繁切换：阅读页里有
+---   <link rel="alternate" hreflang="zh-Hant" href="…/tw/reader/<book>/<chapter>">
+--- 实测 /tw/reader/2385/41719 与 /reader/2385/41719 是同一章、同样 273 段，
+--- 只是字形不同（我们抵达 ↔ 我們抵達）。所以繁体是站点渲染网页时给的。
+---
+--- 但 JSON 接口没有这个开关：charset/lang/simple/traditional/variant/convert
+--- 放 body 或 query、加 Accept-Language、换 /tw 前缀、换 api 子域，返回内容
+--- 一字不差。插件只能走网页这条路，解析交给 Content.reader_page_html()。
+---
+--- @return string|nil 页面 HTML；失败时返回 nil, 原因
+function Client:fetchTraditionalPage(book_id, chapter_id, options)
+    options = options or {}
+    local bid, cid = tonumber(book_id), tonumber(chapter_id)
+    if not bid or not cid then
+        return nil, "no_ids"
+    end
+    local url = string.format("%s/tw/reader/%d/%d", READER_BASE_URL, bid, cid)
+    return self:get(url, { timeout = options.timeout or 60 })
 end
 
 --- Read-only chapter detail via the web proxy; no unlock endpoint is called.

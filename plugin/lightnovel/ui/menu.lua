@@ -568,7 +568,6 @@ function M.showSettings(plugin)
             end),
         },
         {
-        {
             -- 图床白名单总开关。默认开启（推荐）：只允许站点自己引用过的图床，
             -- 免得正文里随便一个 URL（跟踪像素、早已关站的图床）都拖着设备去请求。
             -- 关掉即"任意图床都允许"，代价是可能多等超时、也可能向陌生域名发请求。
@@ -591,6 +590,27 @@ function M.showSettings(plugin)
                 M.showSettings(plugin)
             end),
         },
+        {
+            -- 字形（b59）。轻之国度的书是楼主自己排的：有的卷是台湾版繁体原文，
+            -- 有的卷是大陆简体录入，同一本书里混着的情况都有（实测《游戏人生》
+            -- 第 3 卷某章繁=8607/简=17，其余章反过来）。默认"原文"不动，选了才转。
+            text_func = function()
+                local mode = plugin.settings:get("text.variant", "raw")
+                local labels = { raw = _("原文"), simp = _("简体"), trad = _("繁体") }
+                return string.format(_("字形：%s\n%s"), labels[mode] or _("原文"),
+                    _("下载/重出时按此字形生成；切换后已下载的章节会重新生成"))
+            end,
+            callback = safeCallback(_("字形"), function()
+                local order = { raw = "simp", simp = "trad", trad = "raw" }
+                local mode = plugin.settings:get("text.variant", "raw")
+                plugin.settings:set("text.variant", order[mode] or "simp")
+                plugin.settings:flush()
+                plugin:applyVariantMode()
+                UIManager:close(menu)
+                M.showSettings(plugin)
+            end),
+        },
+        {
             -- The row itself is the feedback. An earlier version showed an
             -- InfoMessage and then immediately closed and reopened this menu,
             -- so the message covered the new list and the tap looked like a
